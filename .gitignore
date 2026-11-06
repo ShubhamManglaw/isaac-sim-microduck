@@ -1,0 +1,45 @@
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Python environments
+.venv/
+venv/
+env/
+
+# ROS 2 / Colcon
+build/
+install/
+log/
+
+# Isaac Sim / Isaac Lab generated data
+.cache/
+.kit/
+.omniverse/
+outputs/
+logs/
+*.log
+
+# Training outputs
+checkpoints/
+wandb/
+runs/
+*.pt
+*.pth
+*.ckpt
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# IDE and operating system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
