@@ -1,7 +1,7 @@
 import argparse
 from isaaclab.app import add_launcher_args, launch_simulation
 import isaaclab.sim as sim_utils
-from isaaclab_newton.physics import NewtonCfg,NewtonShapeCfg,XPBDSolverCfg
+from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
 from isaaclab.assets import AssetBaseCfg, RigidObjectCfg
 from isaaclab.utils import configclass
@@ -24,7 +24,7 @@ class RigidBodyTestCfg(InteractiveSceneCfg):
         )
     )
     cube: RigidObjectCfg = RigidObjectCfg(
-        prim_path="/World/Cube",
+        prim_path="{ENV_REGEX_NS}/Cube",
 
         spawn=sim_utils.CuboidCfg(
             # TODO: Define cube size
@@ -50,15 +50,9 @@ class RigidBodyTestCfg(InteractiveSceneCfg):
     # pass
 
 physics_cfg = NewtonCfg(
-    # TODO: Configure simulation substeps
     num_substeps=10,
-    # TODO: Configure collision settings
     collision_decimation=1,
-    # TODO: Configure solver
-    solver_cfg=XPBDSolverCfg(
-        iterations=20,
-        enable_restitution=True,
-    ),
+    solver_cfg=MJWarpSolverCfg(),
 )
 # TODO 2: Define the rigid-body physics configuration.
 
@@ -103,6 +97,7 @@ def main():
         )
         sim.reset()
         while sim.is_running():
+            scene.write_data_to_sim()
             sim.step()
             scene.update(sim_cfg.dt)
 
