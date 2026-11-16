@@ -52,6 +52,7 @@ from rsl_rl.runners import OnPolicyRunner
 
 from microduck_env_cfg import MicroduckEnvCfg
 from microduck_ppo_cfg import MicroduckPPORunnerCfg
+from microduck_camera import MicroduckCameraEdgeFeed
 
 
 class KeyboardTeleop:
@@ -236,6 +237,32 @@ def find_latest_checkpoint(root_log_dir: Path) -> Path | None:
     return None
 
 
+def load_checkpoint_compatible(runner: OnPolicyRunner, checkpoint_path: Path, device: torch.device | str, target_actor_in: int = 179):
+    """Loads checkpoint state dict with backwards compatibility across architecture upgrades."""
+    loaded_dict = torch.load(str(checkpoint_path), map_location=device, weights_only=False)
+
+    actor_w = loaded_dict["actor_state_dict"]["mlp.0.weight"]
+    current_in = actor_w.shape[1]
+    if current_in < target_actor_in:
+        pad = target_actor_in - current_in
+        print(f"[INFO]: Adapting checkpoint input from {current_in}D -> {target_actor_in}D (padding {pad} vision/edge dims).")
+        loaded_dict["actor_state_dict"]["mlp.0.weight"] = torch.cat(
+            [actor_w, torch.zeros(actor_w.shape[0], pad, device=actor_w.device, dtype=actor_w.dtype)], dim=1
+        )
+        for k in ["obs_normalizer._mean"]:
+            if k in loaded_dict["actor_state_dict"]:
+                t = loaded_dict["actor_state_dict"][k]
+                loaded_dict["actor_state_dict"][k] = torch.cat([t, torch.zeros(1, pad, device=t.device)], dim=1)
+        for k in ["obs_normalizer._var", "obs_normalizer._std"]:
+            if k in loaded_dict["actor_state_dict"]:
+                t = loaded_dict["actor_state_dict"][k]
+                loaded_dict["actor_state_dict"][k] = torch.cat([t, torch.ones(1, pad, device=t.device)], dim=1)
+
+    runner.alg.load(loaded_dict, load_cfg={"actor": True}, strict=True)
+    if "iter" in loaded_dict:
+        runner.current_learning_iteration = loaded_dict["iter"]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate trained Microduck policy with keyboard teleoperation.")
     parser.add_argument("--num_envs", type=int, default=1, help="Number of parallel robots in playback (default: 1 for clean focus).")
@@ -243,6 +270,8 @@ def main():
     parser.add_argument("--speed", type=float, default=1.0, help="Simulation playback speed multiplier (1.0 = real-time, 0.5 = slow-motion).")
     parser.add_argument("--max_steps", type=int, default=None, help="Maximum evaluation steps (default: run forever).")
     parser.add_argument("--export", action="store_true", help="Export policy to ONNX and JIT formats upon load.")
+    parser.add_argument("--camera", dest="camera", action="store_true", default=True, help="Enable live 480p OpenCV camera edge feed.")
+    parser.add_argument("--no-camera", dest="camera", action="store_false", help="Disable live camera edge feed.")
     add_launcher_args(parser)
     parser.set_defaults(visualizer="newton_gl")
     args_cli = parser.parse_args()
@@ -299,7 +328,7 @@ def main():
         runner = OnPolicyRunner(
             wrapped_env, agent_cfg.to_dict(), log_dir=str(log_root_path), device=env.unwrapped.device
         )
-        runner.load(str(checkpoint_path))
+        load_checkpoint_compatible(runner, checkpoint_path, env.unwrapped.device, target_actor_in=179)
         policy = runner.get_inference_policy(device=env.unwrapped.device)
 
         # Export if requested
@@ -319,6 +348,19 @@ def main():
 
         # 5. Initialize Interactive Keyboard Teleop
         teleop = KeyboardTeleop(env=env)
+
+        # 5b. Initialize Live 480p OpenCV Camera Edge Feed
+        camera_feed = None
+        if args_cli.camera:
+            try:
+                camera_feed = MicroduckCameraEdgeFeed(
+                    camera_id=0,
+                    width=640,
+                    height=480,
+                    enable_display=True,
+                )
+            except Exception as e:
+                print(f"[WARNING]: Could not start OpenCV Camera Edge feed: {e}")
 
         print("\n" + "=" * 70)
         print(" MICRODUCK INTERACTIVE KEYBOARD TELEOPERATION")
@@ -378,6 +420,13 @@ def main():
                 # Feed user velocity command directly into policy observation slice (dims 48..51)
                 obs["policy"][:, 48:51] = cmd_tensor
 
+                # 1b. Update live OpenCV camera edge feed and inject into policy observation (dims 115..179)
+                edge_stat_str = ""
+                if camera_feed is not None:
+                    camera_feed.update_display()
+                    live_edge_tensor = camera_feed.get_edge_features_tensor(device=env.unwrapped.device)
+                    obs["policy"][:, 115:179] = live_edge_tensor.repeat(env.num_envs, 1)
+
                 # 2. Forward pass through trained Actor network with strict action clamping
                 with torch.no_grad():
                     actions = policy(obs)
@@ -395,6 +444,8 @@ def main():
                 cmd_term.vel_command_b[:] = cmd_tensor
                 cmd_term.is_heading_env[:] = False
                 obs["policy"][:, 48:51] = cmd_tensor
+                if camera_feed is not None:
+                    obs["policy"][:, 115:179] = live_edge_tensor.repeat(env.num_envs, 1)
 
                 # 4. Telemetry printout every 50 steps (~1.0 second)
                 if step > 0 and step % 50 == 0:
@@ -417,10 +468,15 @@ def main():
                         else:
                             tof_str = f" | ToF: {min_d:4.2f}m"
 
+                    cam_str = ""
+                    if camera_feed is not None:
+                        cam_density = float(camera_feed.latest_edge_grid.mean())
+                        cam_str = f" | Cam Edge: {cam_density:.2f}"
+
                     print(
                         f"Step {step:5d} | {fps:4.1f} fps | Mode: [{mode_str:12s}] | Height: {mean_z*100:4.1f} cm | "
                         f"Cmd: [Vx: {vx:+.2f}, Vy: {vy:+.2f}, Wz: {wz:+.2f}] | "
-                        f"Actual: [Vx: {mean_vx:+.2f} m/s, Wz: {mean_wz:+.2f} rad/s]{tof_str}"
+                        f"Actual: [Vx: {mean_vx:+.2f} m/s, Wz: {mean_wz:+.2f} rad/s]{tof_str}{cam_str}"
                     )
 
                 # 5. Strict Real-Time Wall-Clock Lock
@@ -433,6 +489,8 @@ def main():
 
         finally:
             teleop.close()
+            if camera_feed is not None:
+                camera_feed.close()
             env.close()
             print("\nPlayback closed cleanly.")
 

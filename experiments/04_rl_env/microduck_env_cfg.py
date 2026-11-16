@@ -426,6 +426,38 @@ def tof_depth_observation(
     return torch.clamp(dists, 0.0, max_distance) / max_distance
 
 
+def camera_edges_observation(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("tof_sensor"),
+    edge_threshold: float = 0.15,
+) -> torch.Tensor:
+    """Observation term providing 8x8 spatial camera/depth edge feed (64 dims).
+
+    In simulation: computes 2D spatial edge gradients (Sobel filter) on the 8x8 perception matrix,
+    extracting obstacle silhouettes and ground step edges matching the OpenCV Canny edge detector.
+    In live deployment/teleop: replaced/overridden by the live OpenCV Canny edge detector from webcam.
+    """
+    sensor: RayCaster = env.scene.sensors[sensor_cfg.name]
+    dists = torch.nan_to_num(sensor.data.ray_distances.torch, nan=2.0, posinf=2.0, neginf=0.0)
+    d = dists.view(-1, 1, 8, 8)
+
+    # 3x3 Sobel kernel for horizontal and vertical edge extraction
+    sobel_x = torch.tensor(
+        [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]], device=dists.device
+    ).view(1, 1, 3, 3) / 8.0
+    sobel_y = torch.tensor(
+        [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]], device=dists.device
+    ).view(1, 1, 3, 3) / 8.0
+
+    d_pad = torch.nn.functional.pad(d, (1, 1, 1, 1), mode="replicate")
+    gx = torch.nn.functional.conv2d(d_pad, sobel_x)
+    gy = torch.nn.functional.conv2d(d_pad, sobel_y)
+    grad_mag = torch.sqrt(gx**2 + gy**2 + 1e-6)
+
+    edges = torch.clamp(grad_mag / edge_threshold, 0.0, 1.0)
+    return edges.view(-1, 64)
+
+
 def hurdle_relative_pos(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
@@ -613,6 +645,12 @@ class ObservationsCfg:
         tof_depth = ObservationTermCfg(
             func=tof_depth_observation,
             params={"sensor_cfg": SceneEntityCfg("tof_sensor"), "max_distance": 2.0},
+        )
+
+        # 8. 8x8 OpenCV / Spatial Camera Edge Feed (64 dims, in [0, 1])
+        camera_edges = ObservationTermCfg(
+            func=camera_edges_observation,
+            params={"sensor_cfg": SceneEntityCfg("tof_sensor"), "edge_threshold": 0.15},
         )
 
         def __post_init__(self):
