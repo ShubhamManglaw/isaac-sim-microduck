@@ -63,12 +63,12 @@ class KeyboardTeleop:
         self.cmd_vy = 0.0
         self.cmd_wz = 0.0
 
-        self.step_lin = 0.05
-        self.step_ang = 0.20
-        self.max_lin_x_fwd = 0.40
-        self.max_lin_x_bwd = -0.30
-        self.max_lin_y = 0.25
-        self.max_ang_z = 1.00
+        self.step_lin = 0.10
+        self.step_ang = 0.35
+        self.max_lin_x_fwd = 0.75
+        self.max_lin_x_bwd = -0.40
+        self.max_lin_y = 0.35
+        self.max_ang_z = 2.50
 
         self._running = True
         self._stdin_active = False
@@ -137,11 +137,14 @@ class KeyboardTeleop:
                             elif c == "e":
                                 self.cmd_vy = max(self.cmd_vy - self.step_lin, -self.max_lin_y)
                                 print(f"\r[Key 'E']  Cmd Vy -> {self.cmd_vy:+.2f} m/s", flush=True)
-                            elif c in (" ", "x", "0"):
+                            elif c == "f":
+                                self.cmd_vx = self.max_lin_x_fwd
+                                print(f"\r[SPRINT BOOST 'F'] Cmd Vx -> {self.cmd_vx:+.2f} m/s (Maximum Sprint!)", flush=True)
+                            elif c in (" ", "x", "0", "b"):
                                 self.cmd_vx = 0.0
                                 self.cmd_vy = 0.0
                                 self.cmd_wz = 0.0
-                                print(f"\r[REST / STAND] Cmd -> [0.00, 0.00, 0.00] (Bot at Rest)", flush=True)
+                                print(f"\r[EMERGENCY STOP / REST] Cmd -> [0.00, 0.00, 0.00] (Anti-Fall Braking)", flush=True)
                             idx += 1
             except Exception:
                 break
@@ -187,11 +190,15 @@ class KeyboardTeleop:
                     self.cmd_vy = max(self.cmd_vy - 0.02, -self.max_lin_y)
                     changed = True
 
-                if check_key("space") or check_key("x") or check_key("0"):
+                if check_key("f"):
+                    self.cmd_vx = self.max_lin_x_fwd
+                    changed = True
+
+                if check_key("space") or check_key("x") or check_key("0") or check_key("b"):
                     self.cmd_vx = 0.0
                     self.cmd_vy = 0.0
                     self.cmd_wz = 0.0
-                    print("\r[REST / STAND] Rest Key pressed -> Bot brought to rest!               ", flush=True)
+                    print("\r[EMERGENCY STOP / REST] Rest Key pressed -> Anti-Fall Braking engaged!   ", flush=True)
 
                 if changed:
                     print(
@@ -317,13 +324,14 @@ def main():
         print(" MICRODUCK INTERACTIVE KEYBOARD TELEOPERATION")
         print("=" * 70)
         print(" Controls (usable in BOTH Terminal and 3D Window):")
-        print("   [W] / [Up Arrow]    : Walk Forward       (+Vx)")
-        print("   [S] / [Down Arrow]  : Walk Backward      (-Vx)")
-        print("   [A] / [Left Arrow]  : Turn Left (CCW)    (+Wz)")
-        print("   [D] / [Right Arrow] : Turn Right (CW)    (-Wz)")
-        print("   [Q]                 : Strafe Left        (+Vy)")
-        print("   [E]                 : Strafe Right       (-Vy)")
-        print("   [Space] or [X]      : REST / STAND STILL (Brings bot to rest)")
+        print("   [W] / [Up Arrow]    : Walk Forward       (+Vx up to +0.75 m/s)")
+        print("   [S] / [Down Arrow]  : Walk Backward      (-Vx down to -0.40 m/s)")
+        print("   [A] / [Left Arrow]  : Turn Left (CCW)    (+Wz up to +2.50 rad/s)")
+        print("   [D] / [Right Arrow] : Turn Right (CW)    (-Wz down to -2.50 rad/s)")
+        print("   [Q]                 : Strafe Left        (+Vy up to +0.35 m/s)")
+        print("   [E]                 : Strafe Right       (-Vy down to -0.35 m/s)")
+        print("   [F]                 : Instant Sprint     (Sprint to +0.75 m/s maximum speed)")
+        print("   [B] / [Space] / [X] : EMERGENCY BRAKE    (Sudden stop with active anti-pitch damping)")
         print("   [Ctrl+C]            : Exit Playback")
         print("=" * 70)
         print(f" Loaded Model:   {checkpoint_path.name}")

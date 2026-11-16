@@ -62,31 +62,42 @@ class MicroduckVelocityCommand(UniformVelocityCommand):
         r = torch.empty(num_envs, device=self.device).uniform_(0.0, 1.0)
 
         rel_forward = getattr(self.cfg, "rel_forward_envs", 0.20)
+        rel_sprint = getattr(self.cfg, "rel_sprint_envs", 0.15)
         rel_turn = getattr(self.cfg, "rel_turn_in_place_envs", 0.15)
         rel_bwd = getattr(self.cfg, "rel_backward_envs", 0.10)
         rel_strafe = getattr(self.cfg, "rel_strafe_envs", 0.10)
         rel_sudden_stop = getattr(self.cfg, "rel_sudden_stop_envs", 0.20)
 
         p_fwd = rel_forward
-        p_turn = p_fwd + rel_turn
+        p_sprint = p_fwd + rel_sprint
+        p_turn = p_sprint + rel_turn
         p_bwd = p_turn + rel_bwd
         p_strafe = p_bwd + rel_strafe
         p_stop = p_strafe + rel_sudden_stop
 
-        # 1. Forward-only envs: lin_vel_x in [0.30, 0.40], vy=0, wz=0
+        # 1. Forward walking envs: lin_vel_x in [0.35, 0.55], vy=0, wz=0
         fwd_ids = all_env_ids[(r >= 0.0) & (r < p_fwd)]
         if len(fwd_ids) > 0:
-            min_fwd = getattr(self.cfg, "forward_min_vel", 0.30)
-            max_fwd = self.cfg.ranges.lin_vel_x[1]
-            self.vel_command_b[fwd_ids, 0] = self.vel_command_b[fwd_ids, 0].abs().clamp(min=min_fwd, max=max_fwd)
+            min_fwd = getattr(self.cfg, "forward_min_vel", 0.35)
+            self.vel_command_b[fwd_ids, 0] = torch.empty(len(fwd_ids), device=self.device).uniform_(min_fwd, 0.55)
             self.vel_command_b[fwd_ids, 1] = 0.0
             self.vel_command_b[fwd_ids, 2] = 0.0
             self.is_standing_env[fwd_ids] = False
             if self.cfg.heading_command:
                 self.is_heading_env[fwd_ids] = False
 
-        # 2. Turn-in-place envs: lin=0, |wz| in [0.4*max, max]
-        turn_ids = all_env_ids[(r >= p_fwd) & (r < p_turn)]
+        # 1b. Aggressive Sprint envs: maximum forward velocity lin_vel_x in [0.55, 0.75] m/s!
+        sprint_ids = all_env_ids[(r >= p_fwd) & (r < p_sprint)]
+        if len(sprint_ids) > 0:
+            self.vel_command_b[sprint_ids, 0] = torch.empty(len(sprint_ids), device=self.device).uniform_(0.55, 0.75)
+            self.vel_command_b[sprint_ids, 1] = 0.0
+            self.vel_command_b[sprint_ids, 2] = 0.0
+            self.is_standing_env[sprint_ids] = False
+            if self.cfg.heading_command:
+                self.is_heading_env[sprint_ids] = False
+
+        # 2. Aggressive Turn-in-place envs: lin=0, snappy |wz| up to 2.50 rad/s
+        turn_ids = all_env_ids[(r >= p_sprint) & (r < p_turn)]
         if len(turn_ids) > 0:
             self.vel_command_b[turn_ids, 0] = 0.0
             self.vel_command_b[turn_ids, 1] = 0.0
@@ -101,31 +112,31 @@ class MicroduckVelocityCommand(UniformVelocityCommand):
             if self.cfg.heading_command:
                 self.is_heading_env[turn_ids] = False
 
-        # 3. Backward-only envs: lin_vel_x in [-0.30, -0.15], vy=0, wz=0
+        # 3. Backward-only envs: lin_vel_x in [-0.40, -0.20], vy=0, wz=0
         bwd_ids = all_env_ids[(r >= p_turn) & (r < p_bwd)]
         if len(bwd_ids) > 0:
-            self.vel_command_b[bwd_ids, 0] = torch.empty(len(bwd_ids), device=self.device).uniform_(-0.30, -0.15)
+            self.vel_command_b[bwd_ids, 0] = torch.empty(len(bwd_ids), device=self.device).uniform_(-0.40, -0.20)
             self.vel_command_b[bwd_ids, 1] = 0.0
             self.vel_command_b[bwd_ids, 2] = 0.0
             self.is_standing_env[bwd_ids] = False
             if self.cfg.heading_command:
                 self.is_heading_env[bwd_ids] = False
 
-        # 4. Lateral strafe envs: lin_vel_x=0, |vy| in [0.15, 0.25], wz=0
+        # 4. Aggressive Lateral strafe envs: lin_vel_x=0, |vy| in [0.20, 0.35], wz=0
         strafe_ids = all_env_ids[(r >= p_bwd) & (r < p_strafe)]
         if len(strafe_ids) > 0:
             self.vel_command_b[strafe_ids, 0] = 0.0
             signs_y = torch.where(
                 torch.empty(len(strafe_ids), device=self.device).uniform_(0.0, 1.0) < 0.5, -1.0, 1.0
             )
-            mags_y = torch.empty(len(strafe_ids), device=self.device).uniform_(0.15, 0.25)
+            mags_y = torch.empty(len(strafe_ids), device=self.device).uniform_(0.20, 0.35)
             self.vel_command_b[strafe_ids, 1] = signs_y * mags_y
             self.vel_command_b[strafe_ids, 2] = 0.0
             self.is_standing_env[strafe_ids] = False
             if self.cfg.heading_command:
                 self.is_heading_env[strafe_ids] = False
 
-        # 5. Sudden-Stop envs: Abrupt step-function velocity drop to rest (trains emergency braking)
+        # 5. Sudden-Stop envs: Abrupt step-function velocity drop to rest from high sprint speed
         stop_ids = all_env_ids[(r >= p_strafe) & (r < p_stop)]
         if len(stop_ids) > 0:
             self.vel_command_b[stop_ids, 0] = 0.0
@@ -143,22 +154,25 @@ class MicroduckVelocityCommandCfg(UniformVelocityCommandCfg):
     class_type: type = MicroduckVelocityCommand
 
     rel_forward_envs: float = 0.20
-    """Fraction of envs forced to walk straight forward with lin_vel_x >= 0.30 m/s."""
+    """Fraction of envs forced to walk straight forward with lin_vel_x >= 0.35 m/s."""
 
-    forward_min_vel: float = 0.30
-    """Minimum linear velocity for forward-only walking environments."""
+    rel_sprint_envs: float = 0.15
+    """Fraction of envs forced to sprint forward at aggressive speeds in [0.55, 0.75] m/s."""
+
+    forward_min_vel: float = 0.35
+    """Minimum linear velocity for forward walking environments."""
 
     rel_turn_in_place_envs: float = 0.15
-    """Fraction of envs commanded to spin on the spot (lin=0, |wz| >= 0.4*max)."""
+    """Fraction of envs commanded to spin aggressively on the spot (lin=0, |wz| >= 0.4*max)."""
 
     turn_in_place_min_frac: float = 0.40
     """Lower bound of forced turn-in-place angular rate as fraction of max."""
 
     rel_backward_envs: float = 0.10
-    """Fraction of envs forced to walk backward with lin_vel_x in [-0.30, -0.15] m/s."""
+    """Fraction of envs forced to walk backward with lin_vel_x in [-0.40, -0.20] m/s."""
 
     rel_strafe_envs: float = 0.10
-    """Fraction of envs forced to strafe sideways with |lin_vel_y| in [0.15, 0.25] m/s."""
+    """Fraction of envs forced to strafe sideways with |lin_vel_y| in [0.20, 0.35] m/s."""
 
     rel_sudden_stop_envs: float = 0.20
     """Fraction of envs subjected to sudden step-function velocity drops to rest."""
@@ -354,17 +368,17 @@ def obstacle_jump_and_land(
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     contact_cfg: SceneEntityCfg = SceneEntityCfg("contact_forces"),
     hurdle_dist_min: float = 0.10,
-    hurdle_dist_max: float = 0.35,
-    target_jump_z_vel: float = 0.45,
-    target_jump_height: float = 0.155,
+    hurdle_dist_max: float = 0.38,
+    target_jump_z_vel: float = 0.65,
+    target_jump_height: float = 0.175,
 ) -> torch.Tensor:
-    """Autonomous obstacle jumping and landing reward.
+    """Aggressive autonomous obstacle jumping and landing reward.
 
     Uses the 8x8 ToF depth sensor:
-    - When an obstacle is detected in the near approach zone [0.10m, 0.35m]:
-      - Rewards positive vertical takeoff velocity (base lin_vel_z > 0)
-      - Rewards base elevation clearing the barrier height
-      - Rewards both feet lifting off the ground
+    - When an obstacle is detected in the near approach zone [0.10m, 0.38m]:
+      - Rewards explosive positive vertical takeoff velocity (base lin_vel_z -> 0.65 m/s)
+      - Rewards high base elevation clearing the barrier height (up to 17.5 cm)
+      - Rewards simultaneous tucking of both feet off the ground
     - Upon landing / past the obstacle:
       - Rewards upright posture recovery and absorbing impact smoothly
     """
@@ -384,10 +398,10 @@ def obstacle_jump_and_land(
     air_time = contact_sensor.data.current_air_time.torch
     both_feet_in_air = ((air_time[:, 0] > 0.04) & (air_time[:, 1] > 0.04)).float()
 
-    # Takeoff & upward explosion
-    vz_reward = torch.exp(-torch.square(root_vz - target_jump_z_vel) / 0.10)
-    height_reward = torch.clamp((root_z - 0.12) / (target_jump_height - 0.12 + 1e-6), 0.0, 1.5)
-    jump_reward = (vz_reward + height_reward + 0.5 * both_feet_in_air) * in_jump_zone
+    # Explosive takeoff & upward thrust
+    vz_reward = torch.exp(-torch.square(root_vz - target_jump_z_vel) / 0.12)
+    height_reward = torch.clamp((root_z - 0.12) / (target_jump_height - 0.12 + 1e-6), 0.0, 1.8)
+    jump_reward = (vz_reward + height_reward + 0.6 * both_feet_in_air) * in_jump_zone
 
     # Landing compliance & upright stability
     is_descending = (root_vz < -0.05).float()
@@ -478,15 +492,15 @@ class MicroduckSceneCfg(InteractiveSceneCfg):
         track_air_time=True,
     )
 
-    # Obstacle Hurdle for Jumping and Landing Training (3.5 cm high hurdle)
+    # Obstacle Hurdle for Jumping and Landing Training (4.0 cm tall hurdle)
     hurdle: RigidObjectCfg = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Hurdle",
         spawn=sim_utils.CuboidCfg(
-            size=(0.04, 0.80, 0.035),
+            size=(0.04, 0.90, 0.040),
             rigid_props=sim_utils.UsdPhysicsRigidBodyCfg(kinematic_enabled=True),
             collision_props=sim_utils.UsdPhysicsCollisionCfg(),
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.60, 0.0, 0.0175)),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.60, 0.0, 0.020)),
     )
 
     # 8x8 ToF Depth Sensor (64 rays over head frame targeting ground and obstacles)
@@ -505,19 +519,19 @@ class MicroduckSceneCfg(InteractiveSceneCfg):
 # ==============================================================================
 @configclass
 class ActionsCfg:
-    """Action specifications: 14 joint position target offsets added to default standing angles."""
+    """Action specifications: 14 joint position target offsets with increased range for aggressive strides & jumps."""
 
     joint_pos: mdp.JointPositionActionCfg = mdp.JointPositionActionCfg(
         asset_name="robot",
         joint_names=[".*"],
         scale={
-            ".*hip_yaw.*": 0.25,
-            ".*hip_roll.*": 0.20,
-            ".*hip_pitch.*": 0.50,
-            ".*knee.*": 0.50,
-            ".*ankle.*": 0.50,
-            ".*neck.*": 0.30,
-            ".*head.*": 0.30,
+            ".*hip_yaw.*": 0.35,
+            ".*hip_roll.*": 0.28,
+            ".*hip_pitch.*": 0.70,
+            ".*knee.*": 0.70,
+            ".*ankle.*": 0.65,
+            ".*neck.*": 0.35,
+            ".*head.*": 0.35,
         },
         use_default_offset=True,
     )
@@ -528,23 +542,24 @@ class ActionsCfg:
 # ==============================================================================
 @configclass
 class CommandsCfg:
-    """Velocity command specifications: 360-degree compass heading directions and twist targets matching MuJoCo."""
+    """Velocity command specifications: aggressive sprint up to 0.75 m/s and fast turns up to 2.5 rad/s."""
 
     base_velocity: MicroduckVelocityCommandCfg = MicroduckVelocityCommandCfg(
         asset_name="robot",
-        resampling_time_range=(3.0, 8.0),
+        resampling_time_range=(2.5, 6.0),
         rel_standing_envs=0.02,
         rel_heading_envs=0.20,
         rel_forward_envs=0.20,
+        rel_sprint_envs=0.15,
         rel_backward_envs=0.10,
         rel_turn_in_place_envs=0.15,
         rel_strafe_envs=0.10,
         heading_command=True,
-        heading_control_stiffness=0.5,
+        heading_control_stiffness=0.60,
         ranges=MicroduckVelocityCommandCfg.Ranges(
-            lin_vel_x=(-0.40, 0.40),  # Forward (+vx) and backward (-vx)
-            lin_vel_y=(-0.30, 0.30),  # Lateral strafe (+/- vy)
-            ang_vel_z=(-1.00, 1.00),  # Yaw turning (+/- wz)
+            lin_vel_x=(-0.45, 0.75),  # Aggressive forward sprint up to 0.75 m/s
+            lin_vel_y=(-0.35, 0.35),  # Fast lateral strafe
+            ang_vel_z=(-2.50, 2.50),  # Snappy, aggressive turning up to 2.5 rad/s
             heading=(-math.pi, math.pi),  # 360-degree compass direction exploration
         ),
     )
@@ -757,12 +772,12 @@ class RewardsCfg:
     # 1. Primary Objectives: Velocity Command Tracking & Directional Gain
     track_lin_vel_xy_exp = RewardTermCfg(
         func=mdp.track_lin_vel_xy_exp,
-        weight=2.0,
-        params={"command_name": "base_velocity", "std": math.sqrt(0.1), "asset_cfg": SceneEntityCfg("robot")},
+        weight=3.0,
+        params={"command_name": "base_velocity", "std": math.sqrt(0.15), "asset_cfg": SceneEntityCfg("robot")},
     )
     track_ang_vel_z_exp = RewardTermCfg(
         func=mdp.track_ang_vel_z_exp,
-        weight=2.0,
+        weight=2.5,
         params={"command_name": "base_velocity", "std": math.sqrt(0.5), "asset_cfg": SceneEntityCfg("robot")},
     )
     track_yaw_fine = RewardTermCfg(
@@ -774,12 +789,12 @@ class RewardsCfg:
     # Directional Alignment Gains (Guarantees bot gains reward strictly for moving in the commanded direction)
     directional_lin_gain = RewardTermCfg(
         func=directional_linear_velocity_gain,
-        weight=2.0,
+        weight=3.0,
         params={"command_name": "base_velocity", "asset_cfg": SceneEntityCfg("robot"), "threshold": 0.05},
     )
     directional_yaw_gain = RewardTermCfg(
         func=directional_angular_velocity_gain,
-        weight=2.0,
+        weight=3.0,
         params={"command_name": "base_velocity", "asset_cfg": SceneEntityCfg("robot"), "threshold": 0.10},
     )
     stand_still_rest = RewardTermCfg(
@@ -790,21 +805,21 @@ class RewardsCfg:
     # Sudden Stop Deceleration & Anti-Fall Stabilization (prevents tipping forward when stopping abruptly)
     sudden_stop_balance = RewardTermCfg(
         func=sudden_stop_anti_fall,
-        weight=2.5,
+        weight=3.0,
         params={"command_name": "base_velocity", "asset_cfg": SceneEntityCfg("robot"), "pitch_damping_weight": 0.15},
     )
     # Autonomous 8x8 Depth Obstacle Jumping & Upright Landing
     obstacle_jump = RewardTermCfg(
         func=obstacle_jump_and_land,
-        weight=3.0,
+        weight=4.0,
         params={
             "sensor_cfg": SceneEntityCfg("tof_sensor"),
             "asset_cfg": SceneEntityCfg("robot"),
             "contact_cfg": SceneEntityCfg("contact_forces"),
             "hurdle_dist_min": 0.10,
-            "hurdle_dist_max": 0.35,
-            "target_jump_z_vel": 0.45,
-            "target_jump_height": 0.155,
+            "hurdle_dist_max": 0.38,
+            "target_jump_z_vel": 0.65,
+            "target_jump_height": 0.175,
         },
     )
 
@@ -819,13 +834,14 @@ class RewardsCfg:
         weight=-0.05,
         params={"asset_cfg": SceneEntityCfg("robot")},
     )
+    # Scaled down to -0.02 so it does not penalize explosive obstacle jumping or sprint bounce
     lin_vel_z_l2 = RewardTermCfg(
         func=mdp.lin_vel_z_l2,
-        weight=-0.2,
+        weight=-0.02,
         params={"asset_cfg": SceneEntityCfg("robot")},
     )
 
-    # 3. Leg Posture Anchor (Gaussian variable posture: permits 0.40 rad stepping swing, stops crawling)
+    # 3. Leg Posture Anchor (std_walking = 0.55 rad allows explosive long strides at 0.75 m/s)
     leg_posture = RewardTermCfg(
         func=variable_leg_posture,
         weight=1.0,
@@ -833,7 +849,7 @@ class RewardsCfg:
             "command_name": "base_velocity",
             "asset_cfg": SceneEntityCfg("robot", joint_names=[".*hip.*", ".*knee.*", ".*ankle.*"]),
             "std_standing": 0.15,
-            "std_walking": 0.40,
+            "std_walking": 0.55,
             "walking_threshold": 0.01,
         },
     )
@@ -845,8 +861,8 @@ class RewardsCfg:
         params={"asset_cfg": SceneEntityCfg("robot")},
     )
 
-    # 5. Energy & Action Smoothness (action_rate_l2 matching MuJoCo, NO action_l2 to allow natural stepping)
-    action_rate_l2 = RewardTermCfg(func=mdp.action_rate_l2, weight=-0.08)
+    # 5. Energy & Action Smoothness (action_rate_l2 -0.025 removes sluggish damping for fast reflexes)
+    action_rate_l2 = RewardTermCfg(func=mdp.action_rate_l2, weight=-0.025)
     joint_vel_l2 = RewardTermCfg(
         func=mdp.joint_vel_l2,
         weight=-0.0005,
