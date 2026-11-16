@@ -254,6 +254,12 @@ uv run python train.py --num_envs 8192
 uv run python train.py --num_envs 4096
 ```
 
+### Q5: Bot wobbling or twitching at rest (Zero Velocity Command)
+**Resolution:**
+The system features a dual-layer rest stabilizer:
+1. **Interactive Playback (`play.py`):** Uses an exponential stance blend (`rest_alpha * 0.88` per 20ms step) that smoothly and critically damps actions to zero, settling the robot into the nominal STAND2 stance within ~250ms without relay chattering.
+2. **RL Training (`microduck_env_cfg.py`):** 15% of parallel environments (`rel_standing_envs=0.15`) are permanently tasked with stationary balance. Multi-objective rewards penalize non-zero actions (`stand_still_action_l2`), enforce bilateral ground contact, and lock joint positions to nominal stance.
+
 ---
 
 ## Summary of Essential Commands

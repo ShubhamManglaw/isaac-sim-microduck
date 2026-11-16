@@ -61,12 +61,13 @@ class MicroduckVelocityCommand(UniformVelocityCommand):
 
         r = torch.empty(num_envs, device=self.device).uniform_(0.0, 1.0)
 
-        rel_forward = getattr(self.cfg, "rel_forward_envs", 0.20)
-        rel_sprint = getattr(self.cfg, "rel_sprint_envs", 0.15)
+        rel_forward = getattr(self.cfg, "rel_forward_envs", 0.18)
+        rel_sprint = getattr(self.cfg, "rel_sprint_envs", 0.12)
         rel_turn = getattr(self.cfg, "rel_turn_in_place_envs", 0.15)
         rel_bwd = getattr(self.cfg, "rel_backward_envs", 0.10)
         rel_strafe = getattr(self.cfg, "rel_strafe_envs", 0.10)
-        rel_sudden_stop = getattr(self.cfg, "rel_sudden_stop_envs", 0.20)
+        rel_sudden_stop = getattr(self.cfg, "rel_sudden_stop_envs", 0.15)
+        rel_standing = getattr(self.cfg, "rel_standing_envs", 0.15)
 
         p_fwd = rel_forward
         p_sprint = p_fwd + rel_sprint
@@ -74,6 +75,7 @@ class MicroduckVelocityCommand(UniformVelocityCommand):
         p_bwd = p_turn + rel_bwd
         p_strafe = p_bwd + rel_strafe
         p_stop = p_strafe + rel_sudden_stop
+        p_stand = p_stop + rel_standing
 
         # 1. Forward walking envs: lin_vel_x in [0.35, 0.55], vy=0, wz=0
         fwd_ids = all_env_ids[(r >= 0.0) & (r < p_fwd)]
@@ -146,6 +148,16 @@ class MicroduckVelocityCommand(UniformVelocityCommand):
             if self.cfg.heading_command:
                 self.is_heading_env[stop_ids] = False
 
+        # 6. Stationary Standing At Rest envs (vel=0, continuous stationary standing balance)
+        stand_ids = all_env_ids[(r >= p_stop) & (r < p_stand)]
+        if len(stand_ids) > 0:
+            self.vel_command_b[stand_ids, 0] = 0.0
+            self.vel_command_b[stand_ids, 1] = 0.0
+            self.vel_command_b[stand_ids, 2] = 0.0
+            self.is_standing_env[stand_ids] = True
+            if self.cfg.heading_command:
+                self.is_heading_env[stand_ids] = False
+
 
 @configclass
 class MicroduckVelocityCommandCfg(UniformVelocityCommandCfg):
@@ -153,10 +165,10 @@ class MicroduckVelocityCommandCfg(UniformVelocityCommandCfg):
 
     class_type: type = MicroduckVelocityCommand
 
-    rel_forward_envs: float = 0.20
+    rel_forward_envs: float = 0.18
     """Fraction of envs forced to walk straight forward with lin_vel_x >= 0.35 m/s."""
 
-    rel_sprint_envs: float = 0.15
+    rel_sprint_envs: float = 0.12
     """Fraction of envs forced to sprint forward at aggressive speeds in [0.55, 0.75] m/s."""
 
     forward_min_vel: float = 0.35
@@ -174,8 +186,11 @@ class MicroduckVelocityCommandCfg(UniformVelocityCommandCfg):
     rel_strafe_envs: float = 0.10
     """Fraction of envs forced to strafe sideways with |lin_vel_y| in [0.20, 0.35] m/s."""
 
-    rel_sudden_stop_envs: float = 0.20
+    rel_sudden_stop_envs: float = 0.15
     """Fraction of envs subjected to sudden step-function velocity drops to rest."""
+
+    rel_standing_envs: float = 0.15
+    """Fraction of envs permanently commanded to stand still at rest."""
 
 
 # ==============================================================================
@@ -314,20 +329,59 @@ def stand_still_rest(
     env: ManagerBasedRLEnv,
     command_name: str = "base_velocity",
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_forces"),
     lin_threshold: float = 0.05,
     ang_threshold: float = 0.10,
 ) -> torch.Tensor:
-    """Exponential reward for remaining still when commanded velocity is zero."""
+    """Multi-objective stability reward for remaining motionless in nominal STAND2 pose when at rest.
+
+    Rewards:
+    1. Base linear and angular motion zero (exp(-motion / 0.01))
+    2. Joint velocities motionless (exp(-joint_vel_sq / 0.05))
+    3. Joint positions anchored to nominal STAND2 (exp(-joint_pos_err / 0.02))
+    4. Bilateral foot ground contact (both feet firmly on floor)
+    """
     asset: Articulation = env.scene[asset_cfg.name]
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
     cmd = env.command_manager.get_command(command_name)
     cmd_speed = torch.norm(cmd[:, :2], dim=1)
     wz_cmd = torch.abs(cmd[:, 2])
 
     is_stand_cmd = ((cmd_speed <= lin_threshold) & (wz_cmd <= ang_threshold)).float()
+
+    # 1. Base motionless
     act_lin_speed_sq = torch.sum(torch.square(asset.data.root_lin_vel_b.torch[:, :2]), dim=1)
     act_yaw_sq = torch.square(asset.data.root_ang_vel_b.torch[:, 2])
     motion = act_lin_speed_sq + act_yaw_sq
-    return torch.exp(-motion / 0.02) * is_stand_cmd
+    base_still = torch.exp(-motion / 0.01)
+
+    # 2. Joint velocities motionless
+    joint_vel_sq = torch.mean(torch.square(asset.data.joint_vel.torch), dim=1)
+    joints_still = torch.exp(-joint_vel_sq / 0.05)
+
+    # 3. Joint posture anchored to default standing configuration
+    joint_pos_err = torch.mean(torch.square(asset.data.joint_pos.torch - asset.data.default_joint_pos.torch), dim=1)
+    pose_anchor = torch.exp(-joint_pos_err / 0.02)
+
+    # 4. Bilateral foot ground contact (both feet firmly on floor)
+    forces = torch.norm(contact_sensor.data.net_forces_w.torch[:, sensor_cfg.body_ids], dim=-1)
+    both_feet = ((forces[:, 0] > 1.0) & (forces[:, 1] > 1.0)).float()
+
+    total_rest = 0.35 * base_still + 0.25 * joints_still + 0.20 * pose_anchor + 0.20 * both_feet
+    return total_rest * is_stand_cmd
+
+
+def stand_still_action_l2(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+    vel_threshold: float = 0.05,
+) -> torch.Tensor:
+    """Penalize non-zero motor actions when at rest, forcing policy actions to zero (nominal STAND2 stance)."""
+    cmd = env.command_manager.get_command(command_name)
+    cmd_speed = torch.norm(cmd[:, :2], dim=1) + torch.abs(cmd[:, 2])
+    is_stand_cmd = (cmd_speed < vel_threshold).float()
+    actions = env.action_manager.action
+    return torch.sum(torch.square(actions), dim=1) * is_stand_cmd
 
 
 def sudden_stop_anti_fall(
@@ -579,13 +633,14 @@ class CommandsCfg:
     base_velocity: MicroduckVelocityCommandCfg = MicroduckVelocityCommandCfg(
         asset_name="robot",
         resampling_time_range=(2.5, 6.0),
-        rel_standing_envs=0.02,
+        rel_standing_envs=0.15,
         rel_heading_envs=0.20,
-        rel_forward_envs=0.20,
-        rel_sprint_envs=0.15,
+        rel_forward_envs=0.18,
+        rel_sprint_envs=0.12,
         rel_backward_envs=0.10,
         rel_turn_in_place_envs=0.15,
         rel_strafe_envs=0.10,
+        rel_sudden_stop_envs=0.15,
         heading_command=True,
         heading_control_stiffness=0.60,
         ranges=MicroduckVelocityCommandCfg.Ranges(
@@ -837,9 +892,21 @@ class RewardsCfg:
     )
     stand_still_rest = RewardTermCfg(
         func=stand_still_rest,
-        weight=1.5,
-        params={"command_name": "base_velocity", "asset_cfg": SceneEntityCfg("robot")},
+        weight=3.0,
+        params={
+            "command_name": "base_velocity",
+            "asset_cfg": SceneEntityCfg("robot"),
+            "sensor_cfg": SceneEntityCfg("contact_forces"),
+        },
     )
+    # Heavy penalty for non-zero motor actions when at rest, forcing actions to zero
+    stand_still_action_l2 = RewardTermCfg(
+        func=stand_still_action_l2,
+        weight=-0.5,
+        params={"command_name": "base_velocity"},
+    )
+    # General action L2 penalty preventing network outputs from saturating to extreme logits
+    action_l2 = RewardTermCfg(func=mdp.action_l2, weight=-0.005)
     # Sudden Stop Deceleration & Anti-Fall Stabilization (prevents tipping forward when stopping abruptly)
     sudden_stop_balance = RewardTermCfg(
         func=sudden_stop_anti_fall,
@@ -879,14 +946,14 @@ class RewardsCfg:
         params={"asset_cfg": SceneEntityCfg("robot")},
     )
 
-    # 3. Leg Posture Anchor (std_walking = 0.55 rad allows explosive long strides at 0.75 m/s)
+    # 3. Leg Posture Anchor (tight std_standing=0.10 rad keeps bot steady at rest; std_walking=0.55 rad allows explosive strides)
     leg_posture = RewardTermCfg(
         func=variable_leg_posture,
-        weight=1.0,
+        weight=1.5,
         params={
             "command_name": "base_velocity",
             "asset_cfg": SceneEntityCfg("robot", joint_names=[".*hip.*", ".*knee.*", ".*ankle.*"]),
-            "std_standing": 0.15,
+            "std_standing": 0.10,
             "std_walking": 0.55,
             "walking_threshold": 0.01,
         },
