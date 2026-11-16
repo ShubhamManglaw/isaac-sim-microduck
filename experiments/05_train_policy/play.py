@@ -375,8 +375,9 @@ def main():
                     actions = policy(obs)
                     actions = torch.clamp(actions, -1.0, 1.0)
 
-                # If at rest (Space pressed or zero velocity), lock robot into rock-solid default standing pose
-                if is_at_rest:
+                # Let trained policy actively brake and stabilize until robot comes to a complete stop
+                actual_speed = torch.norm(env.scene["robot"].data.root_link_lin_vel_w.torch[:, :2], dim=1).max().item()
+                if is_at_rest and actual_speed < 0.03:
                     actions = torch.zeros_like(actions)
 
                 # 3. Step environment
@@ -397,10 +398,21 @@ def main():
                     mean_vx = robot.data.root_link_lin_vel_w.torch[:, 0].mean().item()
                     mean_wz = robot.data.root_link_ang_vel_w.torch[:, 2].mean().item()
                     mode_str = "STAND / REST" if is_at_rest else "LOCOMOTION"
+
+                    tof_str = ""
+                    if "tof_sensor" in env.scene.sensors:
+                        tof = env.scene.sensors["tof_sensor"]
+                        dists = torch.nan_to_num(tof.data.ray_distances.torch, nan=2.0)
+                        min_d = dists.min().item()
+                        if min_d < 0.35:
+                            tof_str = f" | [!] ToF Obstacle: {min_d*100:4.1f} cm [JUMP!]"
+                        else:
+                            tof_str = f" | ToF: {min_d:4.2f}m"
+
                     print(
                         f"Step {step:5d} | {fps:4.1f} fps | Mode: [{mode_str:12s}] | Height: {mean_z*100:4.1f} cm | "
                         f"Cmd: [Vx: {vx:+.2f}, Vy: {vy:+.2f}, Wz: {wz:+.2f}] | "
-                        f"Actual: [Vx: {mean_vx:+.2f} m/s, Wz: {mean_wz:+.2f} rad/s]"
+                        f"Actual: [Vx: {mean_vx:+.2f} m/s, Wz: {mean_wz:+.2f} rad/s]{tof_str}"
                     )
 
                 # 5. Strict Real-Time Wall-Clock Lock

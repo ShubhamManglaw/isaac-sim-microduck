@@ -31,7 +31,14 @@ from microduck_ppo_cfg import MicroduckPPORunnerCfg
 def main():
     parser = argparse.ArgumentParser(description="Train Microduck Biped Locomotion Policy with PPO (rsl_rl).")
     parser.add_argument("--num_envs", type=int, default=8192, help="Number of parallel simulation environments.")
-    parser.add_argument("--max_iterations", type=int, default=10000, help="Maximum number of PPO learning iterations.")
+    parser.add_argument("--max_iterations", type=int, default=60000, help="Maximum number of PPO learning iterations.")
+    parser.add_argument(
+        "--preset",
+        type=str,
+        default="laptop",
+        choices=["laptop", "workstation"],
+        help="Hardware preset profile: 'laptop' (8,192 envs for RTX 5060) or 'workstation' (16,384 envs for RTX 5070 Ti / i9 / 64GB).",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for environment and policy.")
     parser.add_argument("--log_dir", type=str, default=None, help="Root directory for experiment logs.")
     parser.add_argument("--resume", action="store_true", default=False, help="Resume training from latest checkpoint.")
@@ -49,6 +56,13 @@ def main():
 
     # 2. Launch simulation context
     with launch_simulation(cfg=physics_cfg, launcher_args=args_cli) as resolved_physics_cfg:
+        # Apply hardware preset
+        if args_cli.preset == "workstation":
+            if args_cli.num_envs == 8192:
+                args_cli.num_envs = 16384
+            if args_cli.max_iterations == 60000:
+                args_cli.max_iterations = 100000
+
         # Create environment configuration
         env_cfg = MicroduckEnvCfg()
         env_cfg.scene.num_envs = args_cli.num_envs
@@ -57,6 +71,9 @@ def main():
 
         # Create PPO Runner configuration
         agent_cfg = MicroduckPPORunnerCfg()
+        if args_cli.preset == "workstation":
+            agent_cfg.algorithm.num_mini_batches = 8
+            agent_cfg.save_interval = 200
         if args_cli.max_iterations is not None:
             agent_cfg.max_iterations = args_cli.max_iterations
 

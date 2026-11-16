@@ -13,15 +13,15 @@ class MicroduckPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     """Configuration for PPO policy training on Microduck biped locomotion."""
 
     num_steps_per_env: int = 24
-    max_iterations: int = 10000
+    max_iterations: int = 60000
     save_interval: int = 100
-    experiment_name: str = "microduck_velocity"
+    experiment_name: str = "microduck_jump_vision_braking"
     empirical_normalization: bool = False
     clip_actions: float = 1.0
 
     obs_groups: dict[str, list[str]] = {
         "actor": ["policy"],
-        "critic": ["policy"],
+        "critic": ["policy", "critic"],
     }
 
     actor: RslRlMLPModelCfg = RslRlMLPModelCfg(
@@ -32,7 +32,7 @@ class MicroduckPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     )
 
     critic: RslRlMLPModelCfg = RslRlMLPModelCfg(
-        hidden_dims=[512, 256, 128],
+        hidden_dims=[512, 512, 256, 128],
         activation="elu",
         obs_normalization=True,
     )

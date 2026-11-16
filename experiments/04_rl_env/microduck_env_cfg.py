@@ -12,7 +12,7 @@ if str(EXP_03_DIR) not in sys.path:
 
 import isaaclab.sim as sim_utils
 import torch
-from isaaclab.assets import Articulation, AssetBaseCfg
+from isaaclab.assets import Articulation, AssetBaseCfg, RigidObject, RigidObjectCfg
 from isaaclab.envs import ManagerBasedRLEnv, ManagerBasedRLEnvCfg
 import isaaclab.envs.mdp as mdp
 from isaaclab.envs.mdp.commands.commands_cfg import UniformVelocityCommandCfg
@@ -27,7 +27,7 @@ from isaaclab.managers import (
     TerminationTermCfg,
 )
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors import ContactSensor, ContactSensorCfg
+from isaaclab.sensors import ContactSensor, ContactSensorCfg, RayCaster, RayCasterCfg, patterns
 from isaaclab.utils import configclass
 
 from microduck_cfg import MicroduckArticulationCfg
@@ -65,11 +65,13 @@ class MicroduckVelocityCommand(UniformVelocityCommand):
         rel_turn = getattr(self.cfg, "rel_turn_in_place_envs", 0.15)
         rel_bwd = getattr(self.cfg, "rel_backward_envs", 0.10)
         rel_strafe = getattr(self.cfg, "rel_strafe_envs", 0.10)
+        rel_sudden_stop = getattr(self.cfg, "rel_sudden_stop_envs", 0.20)
 
         p_fwd = rel_forward
         p_turn = p_fwd + rel_turn
         p_bwd = p_turn + rel_bwd
         p_strafe = p_bwd + rel_strafe
+        p_stop = p_strafe + rel_sudden_stop
 
         # 1. Forward-only envs: lin_vel_x in [0.30, 0.40], vy=0, wz=0
         fwd_ids = all_env_ids[(r >= 0.0) & (r < p_fwd)]
@@ -123,6 +125,16 @@ class MicroduckVelocityCommand(UniformVelocityCommand):
             if self.cfg.heading_command:
                 self.is_heading_env[strafe_ids] = False
 
+        # 5. Sudden-Stop envs: Abrupt step-function velocity drop to rest (trains emergency braking)
+        stop_ids = all_env_ids[(r >= p_strafe) & (r < p_stop)]
+        if len(stop_ids) > 0:
+            self.vel_command_b[stop_ids, 0] = 0.0
+            self.vel_command_b[stop_ids, 1] = 0.0
+            self.vel_command_b[stop_ids, 2] = 0.0
+            self.is_standing_env[stop_ids] = True
+            if self.cfg.heading_command:
+                self.is_heading_env[stop_ids] = False
+
 
 @configclass
 class MicroduckVelocityCommandCfg(UniformVelocityCommandCfg):
@@ -147,6 +159,9 @@ class MicroduckVelocityCommandCfg(UniformVelocityCommandCfg):
 
     rel_strafe_envs: float = 0.10
     """Fraction of envs forced to strafe sideways with |lin_vel_y| in [0.15, 0.25] m/s."""
+
+    rel_sudden_stop_envs: float = 0.20
+    """Fraction of envs subjected to sudden step-function velocity drops to rest."""
 
 
 # ==============================================================================
@@ -301,6 +316,123 @@ def stand_still_rest(
     return torch.exp(-motion / 0.02) * is_stand_cmd
 
 
+def sudden_stop_anti_fall(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    vel_threshold: float = 0.05,
+    pitch_damping_weight: float = 0.15,
+) -> torch.Tensor:
+    """Deceleration stabilization and anti-fall reward for emergency sudden stops.
+
+    When velocity command drops to zero:
+    - Rewards rapid linear speed reduction to zero (|v_xy| -> 0)
+    - Heavily penalizes forward pitch angular velocity spikes (bot tipping forward onto beak)
+    - Heavily penalizes forward tilt (projected gravity x > 0)
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_command(command_name)
+    cmd_speed = torch.norm(cmd[:, :2], dim=1) + torch.abs(cmd[:, 2])
+
+    is_stopped_cmd = (cmd_speed < vel_threshold).float()
+
+    lin_vel_xy = asset.data.root_lin_vel_b.torch[:, :2]
+    lin_speed_sq = torch.sum(torch.square(lin_vel_xy), dim=1)
+    pitch_rate = asset.data.root_ang_vel_b.torch[:, 1]
+    proj_grav = asset.data.projected_gravity_b.torch
+
+    stop_reward = torch.exp(-lin_speed_sq / 0.02)
+    # Penalize pitching forward while braking (pitch_rate^2 + positive forward tilt)
+    pitch_penalty = torch.square(pitch_rate) + torch.clamp(proj_grav[:, 0], min=0.0) * 5.0
+
+    return (stop_reward - pitch_damping_weight * pitch_penalty) * is_stopped_cmd
+
+
+def obstacle_jump_and_land(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("tof_sensor"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    contact_cfg: SceneEntityCfg = SceneEntityCfg("contact_forces"),
+    hurdle_dist_min: float = 0.10,
+    hurdle_dist_max: float = 0.35,
+    target_jump_z_vel: float = 0.45,
+    target_jump_height: float = 0.155,
+) -> torch.Tensor:
+    """Autonomous obstacle jumping and landing reward.
+
+    Uses the 8x8 ToF depth sensor:
+    - When an obstacle is detected in the near approach zone [0.10m, 0.35m]:
+      - Rewards positive vertical takeoff velocity (base lin_vel_z > 0)
+      - Rewards base elevation clearing the barrier height
+      - Rewards both feet lifting off the ground
+    - Upon landing / past the obstacle:
+      - Rewards upright posture recovery and absorbing impact smoothly
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    sensor: RayCaster = env.scene.sensors[sensor_cfg.name]
+    contact_sensor: ContactSensor = env.scene.sensors[contact_cfg.name]
+
+    # 64 ray distances (shape: num_envs, 64)
+    ray_dist = torch.nan_to_num(sensor.data.ray_distances.torch, nan=2.0, posinf=2.0, neginf=0.0)
+    center_dist = ray_dist.view(-1, 8, 8)[:, 2:6, 2:6].reshape(asset.data.root_link_pos_w.shape[0], -1)
+    min_obstacle_dist = center_dist.min(dim=1).values
+    in_jump_zone = ((min_obstacle_dist >= hurdle_dist_min) & (min_obstacle_dist <= hurdle_dist_max)).float()
+
+    root_z = asset.data.root_link_pos_w.torch[:, 2]
+    root_vz = asset.data.root_lin_vel_w.torch[:, 2]
+
+    air_time = contact_sensor.data.current_air_time.torch
+    both_feet_in_air = ((air_time[:, 0] > 0.04) & (air_time[:, 1] > 0.04)).float()
+
+    # Takeoff & upward explosion
+    vz_reward = torch.exp(-torch.square(root_vz - target_jump_z_vel) / 0.10)
+    height_reward = torch.clamp((root_z - 0.12) / (target_jump_height - 0.12 + 1e-6), 0.0, 1.5)
+    jump_reward = (vz_reward + height_reward + 0.5 * both_feet_in_air) * in_jump_zone
+
+    # Landing compliance & upright stability
+    is_descending = (root_vz < -0.05).float()
+    touchdown = ((air_time[:, 0] == 0.0) | (air_time[:, 1] == 0.0)).float()
+    upright = torch.exp(-torch.sum(torch.square(asset.data.projected_gravity_b.torch[:, :2]), dim=1) / 0.05)
+
+    landing_reward = upright * touchdown * is_descending * 0.5
+    return jump_reward + landing_reward
+
+
+def tof_depth_observation(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("tof_sensor"),
+    max_distance: float = 2.0,
+) -> torch.Tensor:
+    """Observation term returning normalized 8x8 ToF depth measurements (64 dims).
+
+    Clipped to [0.0, max_distance] meters and scaled to [0.0, 1.0].
+    """
+    sensor: RayCaster = env.scene.sensors[sensor_cfg.name]
+    dists = torch.nan_to_num(sensor.data.ray_distances.torch, nan=max_distance, posinf=max_distance, neginf=0.0)
+    return torch.clamp(dists, 0.0, max_distance) / max_distance
+
+
+def hurdle_relative_pos(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    hurdle_cfg: SceneEntityCfg = SceneEntityCfg("hurdle"),
+) -> torch.Tensor:
+    """Privileged Critic Observation: exact relative 3D offset from robot base to obstacle hurdle."""
+    robot: Articulation = env.scene[asset_cfg.name]
+    hurdle = env.scene[hurdle_cfg.name]
+    return hurdle.data.root_link_pos_w.torch - robot.data.root_link_pos_w.torch
+
+
+def feet_contact_force_mag(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_forces"),
+) -> torch.Tensor:
+    """Privileged Critic Observation: net contact force magnitude on left and right feet (2 dims)."""
+    sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    forces = sensor.data.net_forces_w.torch
+    return torch.norm(forces, dim=-1)
+
+
 def robot_state_is_nan(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
@@ -344,6 +476,27 @@ class MicroduckSceneCfg(InteractiveSceneCfg):
         prim_path="{ENV_REGEX_NS}/Robot/.*ankle.*",
         history_length=3,
         track_air_time=True,
+    )
+
+    # Obstacle Hurdle for Jumping and Landing Training (3.5 cm high hurdle)
+    hurdle: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/Hurdle",
+        spawn=sim_utils.CuboidCfg(
+            size=(0.04, 0.80, 0.035),
+            rigid_props=sim_utils.UsdPhysicsRigidBodyCfg(kinematic_enabled=True),
+            collision_props=sim_utils.UsdPhysicsCollisionCfg(),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.60, 0.0, 0.0175)),
+    )
+
+    # 8x8 ToF Depth Sensor (64 rays over head frame targeting ground and obstacles)
+    tof_sensor: RayCasterCfg = RayCasterCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/trunk_base",
+        offset=RayCasterCfg.OffsetCfg(pos=(0.05, 0.0, 0.05)),
+        ray_alignment="yaw",
+        pattern_cfg=patterns.GridPatternCfg(resolution=0.02, size=(0.14, 0.14)),
+        mesh_prim_paths=["/World/ground", "{ENV_REGEX_NS}/Hurdle"],
+        global_world_only=False,
     )
 
 
@@ -441,11 +594,53 @@ class ObservationsCfg:
             params={"command_name": "base_velocity"},
         )
 
+        # 7. 8x8 ToF Depth Matrix (64 dims, normalized [0, 1] relative to 2.0m range)
+        tof_depth = ObservationTermCfg(
+            func=tof_depth_observation,
+            params={"sensor_cfg": SceneEntityCfg("tof_sensor"), "max_distance": 2.0},
+        )
+
         def __post_init__(self):
             self.enable_corruption = True
             self.concatenate_terms = True
 
+    @configclass
+    class CriticCfg(ObservationGroupCfg):
+        """Privileged observations provided strictly to the Critic during training (23 extra dims).
+        
+        Supplies ground-truth physical quantities not directly measurable by real onboard sensors:
+        - True base linear velocity in base frame (3 dims)
+        - True base height above ground (1 dim)
+        - True motor joint effort / applied torques (14 dims)
+        - Exact 3D relative vector from robot base to obstacle hurdle (3 dims)
+        - Net contact force magnitude on feet (2 dims)
+        """
+        # 1. True base linear velocity (3 dims)
+        base_lin_vel = ObservationTermCfg(
+            func=mdp.base_lin_vel,
+            params={"asset_cfg": SceneEntityCfg("robot")},
+        )
+        # 2. True base position z (1 dim)
+        base_pos_z = ObservationTermCfg(
+            func=mdp.base_pos_z,
+            params={"asset_cfg": SceneEntityCfg("robot")},
+        )
+        # 3. Motor joint efforts / applied torques (14 dims)
+        joint_effort = ObservationTermCfg(
+            func=mdp.joint_effort,
+            params={"asset_cfg": SceneEntityCfg("robot")},
+        )
+        # 4. Exact relative 3D vector to hurdle obstacle (3 dims)
+        hurdle_rel = ObservationTermCfg(func=hurdle_relative_pos)
+        # 5. Net contact force magnitude on left and right feet (2 dims)
+        foot_forces = ObservationTermCfg(func=feet_contact_force_mag)
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
     policy: PolicyCfg = PolicyCfg()
+    critic: CriticCfg = CriticCfg()
 
 
 # ==============================================================================
@@ -488,14 +683,66 @@ class EventCfg:
         },
     )
 
-    # Periodic velocity push disturbances (every 3 to 6 seconds)
+    # Periodic velocity push disturbances (every 2.5 to 5.0 seconds for robust dynamic balance)
     push_robot = EventTermCfg(
         func=mdp.push_by_setting_velocity,
         mode="interval",
-        interval_range_s=(3.0, 6.0),
+        interval_range_s=(2.5, 5.0),
         params={
             "asset_cfg": SceneEntityCfg("robot"),
-            "velocity_range": {"x": (-0.20, 0.20), "y": (-0.10, 0.10)},
+            "velocity_range": {"x": (-0.35, 0.35), "y": (-0.25, 0.25)},
+        },
+    )
+
+    # Randomize obstacle hurdle position on reset (placed 0.40m to 0.85m in front of robot)
+    reset_hurdle = EventTermCfg(
+        func=mdp.reset_root_state_uniform,
+        mode="reset",
+        params={
+            "pose_range": {
+                "x": (0.40, 0.85),
+                "y": (-0.08, 0.08),
+            },
+            "velocity_range": {},
+            "asset_cfg": SceneEntityCfg("hurdle"),
+        },
+    )
+
+    # --------------------------------------------------------------------------
+    # DOMAIN RANDOMIZATION (Sim-to-Real Robustness)
+    # --------------------------------------------------------------------------
+    # Randomize trunk mass by +/- 15% (simulating payloads, batteries, hardware variations)
+    randomize_trunk_mass = EventTermCfg(
+        func=mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=[".*trunk_base.*"]),
+            "mass_distribution_params": (-0.15, 0.15),
+            "operation": "add",
+        },
+    )
+
+    # Randomize joint friction and armature (+/- 20%)
+    randomize_joint_params = EventTermCfg(
+        func=mdp.randomize_joint_parameters,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*"]),
+            "friction_distribution_params": (0.80, 1.20),
+            "armature_distribution_params": (0.80, 1.20),
+            "operation": "scale",
+        },
+    )
+
+    # Randomize actuator stiffness and damping gains (+/- 15%)
+    randomize_gains = EventTermCfg(
+        func=mdp.randomize_actuator_gains,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*"]),
+            "stiffness_distribution_params": (0.85, 1.15),
+            "damping_distribution_params": (0.85, 1.15),
+            "operation": "scale",
         },
     )
 
@@ -539,6 +786,26 @@ class RewardsCfg:
         func=stand_still_rest,
         weight=1.5,
         params={"command_name": "base_velocity", "asset_cfg": SceneEntityCfg("robot")},
+    )
+    # Sudden Stop Deceleration & Anti-Fall Stabilization (prevents tipping forward when stopping abruptly)
+    sudden_stop_balance = RewardTermCfg(
+        func=sudden_stop_anti_fall,
+        weight=2.5,
+        params={"command_name": "base_velocity", "asset_cfg": SceneEntityCfg("robot"), "pitch_damping_weight": 0.15},
+    )
+    # Autonomous 8x8 Depth Obstacle Jumping & Upright Landing
+    obstacle_jump = RewardTermCfg(
+        func=obstacle_jump_and_land,
+        weight=3.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("tof_sensor"),
+            "asset_cfg": SceneEntityCfg("robot"),
+            "contact_cfg": SceneEntityCfg("contact_forces"),
+            "hurdle_dist_min": 0.10,
+            "hurdle_dist_max": 0.35,
+            "target_jump_z_vel": 0.45,
+            "target_jump_height": 0.155,
+        },
     )
 
     # 2. Torso Upright Stability (Gaussian kernel: weight 2.0, std = sqrt(0.05) matching MuJoCo)
