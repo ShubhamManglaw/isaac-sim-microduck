@@ -21,7 +21,7 @@ class MicroduckPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
     obs_groups: dict[str, list[str]] = {
         "actor": ["policy"],
-        "critic": ["policy", "critic"],
+        "critic": ["policy"],
     }
 
     actor: RslRlMLPModelCfg = RslRlMLPModelCfg(
@@ -32,7 +32,7 @@ class MicroduckPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     )
 
     critic: RslRlMLPModelCfg = RslRlMLPModelCfg(
-        hidden_dims=[512, 512, 256, 128],
+        hidden_dims=[512, 256, 128],
         activation="elu",
         obs_normalization=True,
     )
