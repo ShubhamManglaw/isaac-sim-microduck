@@ -1,8 +1,11 @@
 # Microduck RL — Complete Execution & Deployment Guide
 
-This document contains step-by-step instructions, command references, architecture details, and troubleshooting steps to run, train, evaluate, and deploy the **Microduck Biped Robot Reinforcement Learning Policy** with **multimodal perception (8x8 ToF depth + 480p OpenCV Canny edge vision)**, **explosive hurdle jumping**, **aggressive locomotion (up to 0.75 m/s sprint & 2.5 rad/s turns)**, and **anti-fall emergency braking**.
+This document contains step-by-step instructions, command references, architecture details, and troubleshooting steps to run, train, evaluate, and deploy the **Microduck Biped Robot Reinforcement Learning Policy** with **forward 8x8 ToF depth perception**, **locomotion up to 0.75 m/s and 2.5 rad/s turns**, **curved walking, waypoint following and head look commands**, **hurdle clearance**, **push recovery**, and **anti-fall emergency braking**.
 
 ---
+
+> [!IMPORTANT]
+> To train on the RTX 5070 Ti PC, follow **[AGENT_HANDOFF.md](AGENT_HANDOFF.md)**. It is the authoritative runbook (setup, pilot run, health check, fixes). This guide is the reference for commands and the observation layout.
 
 ## Table of Contents
 
@@ -83,34 +86,44 @@ uv run python /home/shubham/robotics/isaac-sim-microduck/experiments/05_train_po
 The training harness utilizes Isaac Lab's GPU Newton Solver (`MJWarpSolverCfg`) with Asymmetric Actor-Critic (PPO).
 
 ### Preset A: Workstation (RTX 5070 Ti / i9 / 64 GB RAM)
-Runs **16,384 parallel environments** for **100,000 iterations** with 8 mini-batches:
+Runs **16,384 parallel environments** for **15,000 iterations** with 8 mini-batches:
 ```bash
 cd ~/robotics/IsaacLab
 uv run python /home/shubham/robotics/isaac-sim-microduck/experiments/05_train_policy/train.py --preset workstation
 ```
 
-### Preset B: Laptop / Local GPU (RTX 3070/4060/4070)
-Runs **4,096 parallel environments** for **30,000 iterations**:
+### Preset B: Laptop (RTX 5060, 8 GB)
+Runs **8,192 parallel environments** for **10,000 iterations**:
 ```bash
 cd ~/robotics/IsaacLab
 uv run python /home/shubham/robotics/isaac-sim-microduck/experiments/05_train_policy/train.py --preset laptop
 ```
 
 ### Preset C: Fast 2-Iteration Smoke Test
-Validates observation shapes, GPU buffers, and all 18 reward terms in 5 seconds:
+Validates observation shapes, GPU buffers, and all reward terms:
 ```bash
 cd ~/robotics/IsaacLab
 uv run python /home/shubham/robotics/isaac-sim-microduck/experiments/05_train_policy/train.py --num_envs 16 --max_iterations 2
 ```
 
-### Custom Overrides
-You can customize any training run with CLI flags:
+### Custom Overrides and Resuming
 ```bash
-uv run python /path/to/train.py \
-  --num_envs 8192 \
-  --max_iterations 50000 \
-  --experiment_name microduck_custom_run
+# Custom size / length
+uv run python /path/to/train.py --num_envs 8192 --max_iterations 5000
+
+# Continue the most recent run of this experiment (new run folder, weights and curriculum level carried over)
+uv run python /path/to/train.py --preset workstation --resume
+
+# Continue from a specific checkpoint, forcing the curriculum speed scale
+uv run python /path/to/train.py --load_checkpoint /path/to/model_8000.pt --speed_scale 1.0
 ```
+
+### How Training Progresses
+* **Speed curriculum:** commanded speeds start at 50% of the full range. Every 20 s of simulated time the scale grows by 0.05 (up to 1.0) if both hold: linear velocity tracking is above 80% of its maximum, and robots average more than 10 s between falls.
+* **Ramps tied to the curriculum:** random pushes and the smoothness penalties start at 30% strength and reach 100% at scale 1.0.
+* **Fall recovery** is implemented but **off by default** (`reset_fallen` fraction = 0.0 in `microduck_env_cfg.py`). In testing, robots reset on the floor made the physics diverge and, because they are exempt from fall terminations for 8 s, they took over most of the envs and stalled walking. Only try it to fine-tune a policy that already walks well.
+* **Hurdles** (8% of commands place a bar in the robot's path) unlock at scale 0.90 with the 1.5 cm bar only; the 2.5 and 4 cm bars join at scale 1.0.
+* The scale is saved to `curriculum_state.json` in the run folder so `--resume` continues at the same level.
 
 ---
 
@@ -124,18 +137,31 @@ uv run tensorboard --logdir /home/shubham/robotics/isaac-sim-microduck/experimen
 ```
 Open your browser at `http://localhost:6006`.
 
+### Health Checks (look at these first):
+`check_training.py` reads these for you and prints a verdict:
+```bash
+cd ~/robotics/IsaacLab
+uv run python /home/shubham/robotics/isaac-sim-microduck/experiments/05_train_policy/check_training.py
+```
+* `Policy/mean_std`: exploration noise. Starts at 0.6 and should stay between 0.15 and 0.6. If it climbs to the 1.5 cap, the run is not learning (the first training run failed this way, reaching a std of ~30).
+* `Train/mean_episode_length`: should climb toward 1000 steps (20 s). Short episodes mean the robot keeps falling.
+* `Curriculum/command_speed/speed_scale`: 0.5 → 1.0. `.../tracking` and `.../seconds_between_falls` show which of the two gates is holding it back.
+
 ### Key Reward Curves to Watch:
-* `Episode_Reward/track_lin_vel_xy_exp`: Forward sprint velocity tracking ($0.75\text{ m/s}$).
-* `Episode_Reward/obstacle_jump`: Explosive vertical takeoff and landing reward.
+* `Episode_Reward/track_lin_vel_xy_exp`: Linear velocity tracking.
+* `Episode_Reward/gait_contact`: Alternating left / right stepping that follows the gait clock.
+* `Episode_Reward/hurdle_clearance`: Hurdle task (zero until hurdles unlock at speed scale 0.90).
+* `Episode_Reward/fall_penalty`: Cost of falls; should shrink toward 0.
+* `Episode_Termination/nan_state`: robots reset because their physics diverged. Should stay near 0.
+* `Episode_Reward/head_look`: Head look command tracking.
 * `Episode_Reward/sudden_stop_balance`: Anti-pitch damping during rapid deceleration.
-* `Episode_Reward/directional_lin_gain`: Directional alignment gain.
 * `Metrics/base_velocity/error_vel_xy`: Tracking error (should drop toward $0.05\text{ m/s}$).
 
 ---
 
 ## 6. Interactive Playback & Keyboard Teleoperation
 
-Launch real-time 3D physics visualization with the interactive keyboard controller and live OpenCV edge feed window:
+Launch real-time 3D physics visualization with the interactive keyboard controller:
 
 ```bash
 DISPLAY=:0 cd ~/robotics/IsaacLab
@@ -151,6 +177,21 @@ uv run python /home/shubham/robotics/isaac-sim-microduck/experiments/05_train_po
   --load_checkpoint /home/shubham/robotics/isaac-sim-microduck/experiments/05_train_policy/logs/latest/model_59900.pt
 ```
 
+### Playback options:
+```bash
+# Walk a list of waypoints (x,y in metres) on its own; [Space] cancels and returns to keyboard control
+uv run python /path/to/play.py --waypoints "0.6,0;0.6,0.6;0,0"
+
+# Put a hurdle bar 0.6 m in front of the robot (low = 1.5 cm, mid = 2.5 cm, high = 4 cm)
+uv run python /path/to/play.py --hurdle low
+
+# Turn off the playback-side rest stabilizer to see how the policy itself stands still
+uv run python /path/to/play.py --no-rest-blend
+
+# Feed live webcam Canny edges into the edge inputs (outside the training distribution; off by default)
+uv run python /path/to/play.py --camera
+```
+
 ### Interactive Keyboard Controls:
 | Key | Command | Action & Speed Range |
 | :--- | :--- | :--- |
@@ -161,7 +202,10 @@ uv run python /home/shubham/robotics/isaac-sim-microduck/experiments/05_train_po
 | **`[Q]`** | **Strafe Left** | Sidestep left up to $+0.35\text{ m/s}$ |
 | **`[E]`** | **Strafe Right** | Sidestep right down to $-0.35\text{ m/s}$ |
 | **`[F]`** | **Instant Sprint Boost** | Commands maximum **$+0.75\text{ m/s}$** sprint speed |
-| **`[B]` / `[Space]` / `[X]`**| **EMERGENCY HARD BRAKE** | Instantly drops command to zero; robot engages anti-pitch braking reaction |
+| **`[B]` / `[Space]` / `[X]`**| **EMERGENCY HARD BRAKE** | Instantly drops command to zero; also cancels waypoint following |
+| **`[I]` / `[K]`** | **Head Look Up / Down** | Head pitch offset up to $\pm 0.35\text{ rad}$ |
+| **`[J]` / `[L]`** | **Head Look Left / Right** | Head yaw offset up to $\pm 0.70\text{ rad}$ |
+| **`[C]`** | **Center Head** | Resets the head look command |
 | **`[Ctrl+C]`** | **Exit** | Automatically exports `policy.pt` and `policy.onnx` |
 
 > [!TIP]
@@ -171,27 +215,41 @@ uv run python /home/shubham/robotics/isaac-sim-microduck/experiments/05_train_po
 
 ## 7. Policy Architecture & Observation Breakdown
 
-### 179D Policy Observation Space (Actor)
+### 285D Policy Observation Space (Actor)
+The first six terms keep a **3-step history**: the two previous 20 ms samples followed by the current one (oldest first).
+
 | Indices | Observation Term | Dims | Description |
 | :---: | :--- | :---: | :--- |
-| `0..3` | `projected_gravity` | 3 | Gravity vector in base frame $[g_x, g_y, g_z]$ |
-| `3..6` | `base_ang_vel` | 3 | Base angular velocity $[\omega_x, \omega_y, \omega_z]$ |
-| `6..20` | `joint_pos` | 14 | Current joint angles (relative to nominal STAND2) |
-| `20..34` | `joint_vel` | 14 | Current joint angular velocities |
-| `34..48` | `actions` | 14 | Previous action vector applied to motors |
-| `48..51` | `velocity_commands` | 3 | Commanded velocity $[v_x, v_y, \omega_z]$ |
-| `51..115`| `tof_depth` | 64 | 8x8 ToF distance matrix normalized in $[0, 1]$ |
-| `115..179`| `camera_edges` | 64 | **8x8 OpenCV spatial edge density grid** in $[0, 1]$ |
-| **Total**| **Actor Observation** | **179** | Input to MLP `[512, 256, 128]` $\rightarrow$ 14 actions |
+| `0..9` | `projected_gravity` | 3 × 3 | Gravity vector in base frame $[g_x, g_y, g_z]$ |
+| `9..18` | `base_ang_vel` | 3 × 3 | Base angular velocity $[\omega_x, \omega_y, \omega_z]$ |
+| `18..60` | `joint_pos` | 3 × 14 | Joint angles (relative to nominal STAND2) |
+| `60..102` | `joint_vel` | 3 × 14 | Joint angular velocities |
+| `102..144` | `actions` | 3 × 14 | Previous action vectors |
+| `144..153` | `velocity_commands` | 3 × 3 | Commanded velocity $[v_x, v_y, \omega_z]$ |
+| `153..217`| `tof_depth` | 64 | Forward 8x8 ToF distances (row 0 = top of view), normalized by the 1 m range |
+| `217..281`| `camera_edges` | 64 | 8x8 Sobel edge map of the depth image in $[0, 1]$ |
+| `281..283`| `head_look` | 2 | Commanded head pitch / yaw offsets [rad] |
+| `283..285`| `gait_clock` | 2 | $(\sin, \cos)$ of the gait cycle phase; zero when commanded to stand |
+| **Total**| **Actor Observation** | **285** | Input to MLP `[512, 256, 128]` $\rightarrow$ 14 actions |
 
-### 202D Privileged Critic Observation Space (Critic)
-Contains all 179 Actor observations $+$ 23 ground-truth simulation states:
+In code, get these ranges from `observation_term_slices(env, "policy")` in `microduck_env_cfg.py` rather than hardcoding them.
+
+* Gravity, angular velocity, joint position / velocity and ToF inputs carry uniform noise during training.
+* Actions are joint position offsets (`action * scale + default pose`), clipped to $\pm 3$ and then clamped to the joint limits.
+* The gait clock advances each 20 ms step by `gait_frequency(command) * 0.02`, where the cycle takes 0.50 s near zero speed and shortens linearly to 0.30 s at 0.75 m/s (`gait_frequency` in `microduck_env_cfg.py`).
+
+### 311D Privileged Critic Observation Space (Critic)
+Contains all 285 Actor observations $+$ 26 ground-truth simulation states:
 * `base_lin_vel` (3D): True linear velocity in base frame.
 * `base_pos_z` (1D): True base elevation above ground plane.
 * `joint_effort` (14D): Applied joint torques.
-* `hurdle_rel` (3D): Exact 3D vector from robot base to hurdle obstacle.
+* `hurdle_state` (4D): Robot position in the hurdle frame, bar height, hurdle-active flag.
 * `foot_forces` (2D): Net contact force magnitude on feet.
-* **Total Critic Input:** **202 dimensions** $\rightarrow$ MLP `[512, 512, 256, 128]` $\rightarrow$ 1 value.
+* `task_flags` (2D): Recovering from a fall, following a waypoint.
+* **Total Critic Input:** **311 dimensions** $\rightarrow$ MLP `[512, 512, 256, 128]` $\rightarrow$ 1 value.
+
+> [!NOTE]
+> Checkpoints trained on an older observation layout (115D or 179D) are not compatible. `play.py` refuses them with an explanation.
 
 ---
 
@@ -215,7 +273,8 @@ policy = torch.jit.load("policy.pt")
 policy.eval()
 
 # Run real camera edge extractor
-# obs_tensor shape: (1, 179)
+# obs_tensor shape: (1, 285), built in the index order of the table in section 7,
+# including the 3-step history and the speed-dependent gait clock described there
 with torch.no_grad():
     motor_actions = policy(obs_tensor)
 ```
@@ -257,8 +316,15 @@ uv run python train.py --num_envs 4096
 ### Q5: Bot wobbling or twitching at rest (Zero Velocity Command)
 **Resolution:**
 The system features a dual-layer rest stabilizer:
-1. **Interactive Playback (`play.py`):** Uses an exponential stance blend (`rest_alpha * 0.88` per 20ms step) that smoothly and critically damps actions to zero, settling the robot into the nominal STAND2 stance within ~250ms without relay chattering.
-2. **RL Training (`microduck_env_cfg.py`):** 15% of parallel environments (`rel_standing_envs=0.15`) are permanently tasked with stationary balance. Multi-objective rewards penalize non-zero actions (`stand_still_action_l2`), enforce bilateral ground contact, and lock joint positions to nominal stance.
+1. **Interactive Playback (`play.py`):** Uses an exponential stance blend (`rest_alpha * 0.88` per 20ms step) that fades the leg actions toward zero, settling the robot into the nominal STAND2 stance. Disable it with `--no-rest-blend` to check the policy's own standing behavior.
+2. **RL Training (`microduck_env_cfg.py`):** 14% of commands (`rel_standing_envs=0.14`) are stand-still commands. Multi-objective rewards penalize non-zero leg actions (`stand_still_action_l2`), enforce bilateral ground contact, and lock joint positions to nominal stance.
+
+### Q7: `ValueError: The ground slab ... is too small for N robots`
+**Cause:** robots are placed on a grid `env_spacing` apart, and the grid for this many robots would extend past the ground slab. Robots beyond the edge would fall forever and poison training (this is what happened in the first training run: 81% of 8,192 robots had no ground).
+**Fix:** increase `GROUND_SIZE` in `microduck_env_cfg.py`, or lower `scene.env_spacing`.
+
+### Q6: `Policy/mean_std` keeps rising / episodes stay very short
+**Cause:** exploration noise is winning over the reward signal. Check that `clip_actions` in `microduck_ppo_cfg.py` is still wide (3.0) and `entropy_coef` is small (0.005). With a tight $\pm 1$ clip the action penalties cannot see large actions and the noise grows without limit. Run `check_training.py` and apply the fix it names from `AGENT_HANDOFF.md`.
 
 ---
 
@@ -271,7 +337,7 @@ cd ~/robotics/isaac-sim-microduck && git pull origin main
 # 2. Test 480p OpenCV Camera Edge Window
 DISPLAY=:0 cd ~/robotics/IsaacLab && uv run python /home/shubham/robotics/isaac-sim-microduck/experiments/05_train_policy/test_camera_edges.py
 
-# 3. Train from Scratch (Workstation: 16k envs, 100k iters)
+# 3. Train from Scratch (Workstation: 16k envs, 15k iters)
 cd ~/robotics/IsaacLab && uv run python /home/shubham/robotics/isaac-sim-microduck/experiments/05_train_policy/train.py --preset workstation
 
 # 4. Interactive Keyboard Teleoperation & Real-Time Playback

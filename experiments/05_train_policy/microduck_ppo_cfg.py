@@ -8,16 +8,36 @@ from isaaclab_rl.rsl_rl import (
 )
 
 
+def build_runner(wrapped_env, agent_cfg: "MicroduckPPORunnerCfg", log_dir: str | None, device: str):
+    """Create the rsl_rl OnPolicyRunner for this config.
+
+    Works across Isaac Lab versions: the config clean-up helpers are used when the installed
+    ``isaaclab_rl`` still ships them and skipped when it does not.
+    """
+    from rsl_rl.runners import OnPolicyRunner
+
+    try:
+        from isaaclab_rl.rsl_rl import check_rsl_rl_version, handle_deprecated_rsl_rl_cfg
+
+        agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, check_rsl_rl_version())
+    except ImportError:
+        pass
+    return OnPolicyRunner(wrapped_env, agent_cfg.to_dict(), log_dir=log_dir, device=device)
+
+
 @configclass
 class MicroduckPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     """Configuration for PPO policy training on Microduck biped locomotion."""
 
     num_steps_per_env: int = 24
-    max_iterations: int = 60000
-    save_interval: int = 100
-    experiment_name: str = "microduck_jump_vision_braking"
+    max_iterations: int = 10000
+    save_interval: int = 200
+    experiment_name: str = "microduck_agile_v2"
     empirical_normalization: bool = False
-    clip_actions: float = 1.0
+    # Wide clip on purpose. With a tight +/-1 clip the environment never sees large actions, so the action
+    # penalties cannot push back on the exploration noise and the entropy bonus inflates it without limit
+    # (the previous run ended with a noise std of ~30). play.py must use the same value.
+    clip_actions: float = 3.0
 
     obs_groups: dict[str, list[str]] = {
         "actor": ["policy"],
@@ -28,7 +48,11 @@ class MicroduckPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         hidden_dims=[512, 256, 128],
         activation="elu",
         obs_normalization=True,
-        distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=1.0),
+        # std_range is a safety net: a healthy run settles between the bounds. The lower bound keeps
+        # exploration alive (the noise fell to 0.23 within 200 iterations in validation).
+        distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(
+            init_std=0.6, std_type="log", std_range=(0.15, 1.5)
+        ),
     )
 
     critic: RslRlMLPModelCfg = RslRlMLPModelCfg(
@@ -41,7 +65,7 @@ class MicroduckPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.01,
+        entropy_coef=0.005,
         num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate=1.0e-3,

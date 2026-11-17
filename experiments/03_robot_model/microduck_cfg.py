@@ -62,8 +62,8 @@ class MicroduckArticulationCfg(ArticulationCfg):
             stiffness=8.5,
             damping=0.45,
             armature=0.0018,
-            effort_limit=0.96,
-            velocity_limit=10.0,
+            actuator_effort_limit=0.96,
+            actuator_velocity_limit=10.0,
         )
     }
     # -------------------------------------------------------------

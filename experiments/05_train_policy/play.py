@@ -8,6 +8,12 @@ Usage:
   # Run in smooth 0.5x slow-motion for detailed gait inspection:
   uv run python ~/robotics/isaac-sim-microduck/experiments/05_train_policy/play.py --num_envs 1 --speed 0.5
 
+  # Walk a list of waypoints (x,y in metres, world frame) autonomously; [Space] cancels:
+  uv run python ~/robotics/isaac-sim-microduck/experiments/05_train_policy/play.py --waypoints "0.6,0;0.6,0.6;0,0"
+
+  # Put a hurdle bar 0.6 m in front of the robot (low = 1.5 cm, mid = 2.5 cm, high = 4 cm):
+  uv run python ~/robotics/isaac-sim-microduck/experiments/05_train_policy/play.py --hurdle low
+
   # Or specify checkpoint explicitly:
   uv run python ~/robotics/isaac-sim-microduck/experiments/05_train_policy/play.py \
     --load_checkpoint ~/robotics/isaac-sim-microduck/experiments/05_train_policy/logs/latest/model_900.pt \
@@ -39,19 +45,17 @@ for p in [EXP_DIR, EXP_04_DIR, EXP_03_DIR]:
 import torch
 from isaaclab.app import add_launcher_args, launch_simulation
 from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg
-from isaaclab.envs import ManagerBasedRLEnv
-from isaaclab_rl.rsl_rl import (
-    RslRlOnPolicyRunnerCfg,
-    RslRlVecEnvWrapper,
-    check_rsl_rl_version,
-    export_policy_as_jit,
-    export_policy_as_onnx,
-    handle_deprecated_rsl_rl_cfg,
-)
+from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 from rsl_rl.runners import OnPolicyRunner
 
-from microduck_env_cfg import MicroduckEnvCfg
-from microduck_ppo_cfg import MicroduckPPORunnerCfg
+from microduck_env_cfg import (
+    HURDLE_NAMES,
+    MicroduckEnv,
+    MicroduckEnvCfg,
+    observation_term_slices,
+    waypoint_velocity_controller,
+)
+from microduck_ppo_cfg import MicroduckPPORunnerCfg, build_runner
 from microduck_camera import MicroduckCameraEdgeFeed
 
 
@@ -63,6 +67,16 @@ class KeyboardTeleop:
         self.cmd_vx = 0.0
         self.cmd_vy = 0.0
         self.cmd_wz = 0.0
+
+        # Head look command (offsets from the default head pose)
+        self.cmd_head_pitch = 0.0
+        self.cmd_head_yaw = 0.0
+        self.step_head = 0.10
+        self.max_head_pitch = 0.35
+        self.max_head_yaw = 0.70
+
+        # Incremented on every stop key press (used to cancel waypoint following)
+        self.stop_count = 0
 
         self.step_lin = 0.10
         self.step_ang = 0.35
@@ -141,7 +155,24 @@ class KeyboardTeleop:
                             elif c == "f":
                                 self.cmd_vx = self.max_lin_x_fwd
                                 print(f"\r[SPRINT BOOST 'F'] Cmd Vx -> {self.cmd_vx:+.2f} m/s (Maximum Sprint!)", flush=True)
+                            elif c in ("i", "k", "j", "l", "c"):
+                                if c == "i":
+                                    self.cmd_head_pitch = max(self.cmd_head_pitch - self.step_head, -self.max_head_pitch)
+                                elif c == "k":
+                                    self.cmd_head_pitch = min(self.cmd_head_pitch + self.step_head, self.max_head_pitch)
+                                elif c == "j":
+                                    self.cmd_head_yaw = min(self.cmd_head_yaw + self.step_head, self.max_head_yaw)
+                                elif c == "l":
+                                    self.cmd_head_yaw = max(self.cmd_head_yaw - self.step_head, -self.max_head_yaw)
+                                else:
+                                    self.cmd_head_pitch = 0.0
+                                    self.cmd_head_yaw = 0.0
+                                print(
+                                    f"\r[HEAD] Pitch -> {self.cmd_head_pitch:+.2f} rad | Yaw -> {self.cmd_head_yaw:+.2f} rad",
+                                    flush=True,
+                                )
                             elif c in (" ", "x", "0", "b"):
+                                self.stop_count += 1
                                 self.cmd_vx = 0.0
                                 self.cmd_vy = 0.0
                                 self.cmd_wz = 0.0
@@ -157,6 +188,7 @@ class KeyboardTeleop:
             viewer = getattr(viz, "_viewer", viz)
             if hasattr(viewer, "_paused") and viewer._paused:
                 viewer._paused = False
+                self.stop_count += 1
                 self.cmd_vx = 0.0
                 self.cmd_vy = 0.0
                 self.cmd_wz = 0.0
@@ -195,7 +227,20 @@ class KeyboardTeleop:
                     self.cmd_vx = self.max_lin_x_fwd
                     changed = True
 
+                if check_key("i"):
+                    self.cmd_head_pitch = max(self.cmd_head_pitch - 0.02, -self.max_head_pitch)
+                elif check_key("k"):
+                    self.cmd_head_pitch = min(self.cmd_head_pitch + 0.02, self.max_head_pitch)
+                if check_key("j"):
+                    self.cmd_head_yaw = min(self.cmd_head_yaw + 0.02, self.max_head_yaw)
+                elif check_key("l"):
+                    self.cmd_head_yaw = max(self.cmd_head_yaw - 0.02, -self.max_head_yaw)
+                if check_key("c"):
+                    self.cmd_head_pitch = 0.0
+                    self.cmd_head_yaw = 0.0
+
                 if check_key("space") or check_key("x") or check_key("0") or check_key("b"):
+                    self.stop_count += 1
                     self.cmd_vx = 0.0
                     self.cmd_vy = 0.0
                     self.cmd_wz = 0.0
@@ -245,26 +290,19 @@ def find_latest_checkpoint(root_log_dir: Path) -> Path | None:
     return None
 
 
-def load_checkpoint_compatible(runner: OnPolicyRunner, checkpoint_path: Path, device: torch.device | str, target_actor_in: int = 179):
-    """Loads checkpoint state dict with backwards compatibility across architecture upgrades."""
+def load_checkpoint_checked(runner: OnPolicyRunner, checkpoint_path: Path, device: torch.device | str, actor_obs_dim: int):
+    """Load the actor from a checkpoint, refusing checkpoints trained on a different observation layout."""
     loaded_dict = torch.load(str(checkpoint_path), map_location=device, weights_only=False)
 
-    actor_w = loaded_dict["actor_state_dict"]["mlp.0.weight"]
-    current_in = actor_w.shape[1]
-    if current_in < target_actor_in:
-        pad = target_actor_in - current_in
-        print(f"[INFO]: Adapting checkpoint input from {current_in}D -> {target_actor_in}D (padding {pad} vision/edge dims).")
-        loaded_dict["actor_state_dict"]["mlp.0.weight"] = torch.cat(
-            [actor_w, torch.zeros(actor_w.shape[0], pad, device=actor_w.device, dtype=actor_w.dtype)], dim=1
+    checkpoint_obs_dim = loaded_dict["actor_state_dict"]["mlp.0.weight"].shape[1]
+    if checkpoint_obs_dim != actor_obs_dim:
+        print(
+            f"[ERROR]: {checkpoint_path.name} expects {checkpoint_obs_dim}D observations, but this environment"
+            f" provides {actor_obs_dim}D. The checkpoint was trained on a different version of the environment"
+            " (different sensors / observation history) and cannot be played with this code."
+            " Train a new policy with train.py, or check out the commit the checkpoint was trained on."
         )
-        for k in ["obs_normalizer._mean"]:
-            if k in loaded_dict["actor_state_dict"]:
-                t = loaded_dict["actor_state_dict"][k]
-                loaded_dict["actor_state_dict"][k] = torch.cat([t, torch.zeros(1, pad, device=t.device)], dim=1)
-        for k in ["obs_normalizer._var", "obs_normalizer._std"]:
-            if k in loaded_dict["actor_state_dict"]:
-                t = loaded_dict["actor_state_dict"][k]
-                loaded_dict["actor_state_dict"][k] = torch.cat([t, torch.ones(1, pad, device=t.device)], dim=1)
+        sys.exit(1)
 
     runner.alg.load(loaded_dict, load_cfg={"actor": True}, strict=True)
     if "iter" in loaded_dict:
@@ -278,8 +316,35 @@ def main():
     parser.add_argument("--speed", type=float, default=1.0, help="Simulation playback speed multiplier (1.0 = real-time, 0.5 = slow-motion).")
     parser.add_argument("--max_steps", type=int, default=None, help="Maximum evaluation steps (default: run forever).")
     parser.add_argument("--export", action="store_true", help="Export policy to ONNX and JIT formats upon load.")
-    parser.add_argument("--camera", dest="camera", action="store_true", default=True, help="Enable live 480p OpenCV camera edge feed.")
-    parser.add_argument("--no-camera", dest="camera", action="store_false", help="Disable live camera edge feed.")
+    parser.add_argument(
+        "--camera",
+        dest="camera",
+        action="store_true",
+        default=False,
+        help="Replace the simulated depth-edge inputs with live 480p OpenCV webcam edges (off by default: the policy"
+        " is trained on depth edges, so webcam edges are outside its training distribution).",
+    )
+    parser.add_argument("--no-camera", dest="camera", action="store_false", help="Use simulated depth edges (default).")
+    parser.add_argument(
+        "--waypoints",
+        type=str,
+        default=None,
+        help='Waypoints to walk to, as "x,y;x,y;..." in metres (world frame of each env). [Space] cancels.',
+    )
+    parser.add_argument(
+        "--hurdle",
+        type=str,
+        default="none",
+        choices=["none", "low", "mid", "high"],
+        help="Place a hurdle bar 0.6 m in front of the robot (low = 1.5 cm, mid = 2.5 cm, high = 4 cm).",
+    )
+    parser.add_argument(
+        "--no-rest-blend",
+        dest="rest_blend",
+        action="store_false",
+        default=True,
+        help="Disable the playback-side rest stabilizer, to see how the policy itself stands still.",
+    )
     add_launcher_args(parser)
     parser.set_defaults(visualizer="newton_gl")
     args_cli = parser.parse_args()
@@ -322,35 +387,39 @@ def main():
             "yaw": (0.0, 0.0),
         }
         env_cfg.events.reset_base.params["velocity_range"] = {}
+        # Never reset robots lying on the floor, and take commands from this script instead of sampling them
+        env_cfg.events.reset_fallen.params["fraction"] = 0.0
+        env_cfg.commands.base_velocity.external_control = True
+        env_cfg.commands.base_velocity.initial_speed_scale = 1.0
+        env_cfg.curriculum.command_speed = None
+        # Clean sensor readings for playback
+        env_cfg.observations.policy.enable_corruption = False
+        env_cfg.observations.policy.tof_depth.params["noise"] = 0.0
 
-        # 3. Instantiate Vectorized RL Environment with STRICT [-1.0, 1.0] Action Clipping
-        env = ManagerBasedRLEnv(cfg=env_cfg)
-        wrapped_env = RslRlVecEnvWrapper(env, clip_actions=1.0)
+        # 3. Instantiate Vectorized RL Environment with the same action clipping as in training
+        agent_cfg = MicroduckPPORunnerCfg()
+        action_clip = float(agent_cfg.clip_actions)
+
+        env = MicroduckEnv(cfg=env_cfg)
+        wrapped_env = RslRlVecEnvWrapper(env, clip_actions=action_clip)
 
         # 4. Load Agent Policy
-        agent_cfg: RslRlOnPolicyRunnerCfg = MicroduckPPORunnerCfg()
-        installed_version = check_rsl_rl_version()
-        agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
 
         log_root_path = checkpoint_path.parent
-        runner = OnPolicyRunner(
-            wrapped_env, agent_cfg.to_dict(), log_dir=str(log_root_path), device=env.unwrapped.device
-        )
-        load_checkpoint_compatible(runner, checkpoint_path, env.unwrapped.device, target_actor_in=179)
+        runner = build_runner(wrapped_env, agent_cfg, log_dir=str(log_root_path), device=env.unwrapped.device)
+        actor_obs_dim = wrapped_env.get_observations()["policy"].shape[-1]
+        load_checkpoint_checked(runner, checkpoint_path, env.unwrapped.device, actor_obs_dim=actor_obs_dim)
         policy = runner.get_inference_policy(device=env.unwrapped.device)
 
         # Export if requested
         if args_cli.export:
             export_dir = log_root_path / "exported"
             export_dir.mkdir(exist_ok=True, parents=True)
-            export_policy_as_jit(runner.alg.actor_critic, str(export_dir / "policy.pt"))
+            runner.export_policy_to_jit(path=str(export_dir), filename="policy.pt")
+            print(f"[INFO]: Exported JIT policy to {export_dir / 'policy.pt'}")
             try:
-                export_policy_as_onnx(
-                    runner.alg.actor_critic,
-                    normalizer=runner.obs_normalizer,
-                    path=str(export_dir / "policy.onnx"),
-                )
-                print(f"[INFO]: Exported policy to {export_dir}")
+                runner.export_policy_to_onnx(path=str(export_dir), filename="policy.onnx")
+                print(f"[INFO]: Exported ONNX policy to {export_dir / 'policy.onnx'}")
             except Exception as e:
                 print(f"[WARNING]: ONNX export skipped: {e}")
 
@@ -381,24 +450,44 @@ def main():
         print("   [Q]                 : Strafe Left        (+Vy up to +0.35 m/s)")
         print("   [E]                 : Strafe Right       (-Vy down to -0.35 m/s)")
         print("   [F]                 : Instant Sprint     (Sprint to +0.75 m/s maximum speed)")
-        print("   [B] / [Space] / [X] : EMERGENCY BRAKE    (Sudden stop with active anti-pitch damping)")
+        print("   [B] / [Space] / [X] : EMERGENCY BRAKE    (Sudden stop; also cancels waypoint following)")
+        print("   [I] / [K]           : Head Look Up / Down (pitch offset up to +/-0.35 rad)")
+        print("   [J] / [L]           : Head Look Left / Right (yaw offset up to +/-0.70 rad)")
+        print("   [C]                 : Center Head")
         print("   [Ctrl+C]            : Exit Playback")
         print("=" * 70)
         print(f" Loaded Model:   {checkpoint_path.name}")
         print(f" Robot Envs:     {args_cli.num_envs}")
         print(f" Playback Speed: {args_cli.speed:.2f}x (Real-time locked)")
+        print(f" Hurdle:         {args_cli.hurdle}")
+        print(f" Waypoints:      {args_cli.waypoints or 'none (keyboard control)'}")
+        print(f" Rest Blend:     {'on' if args_cli.rest_blend else 'off (policy stands on its own)'}")
         print("=" * 70 + "\n")
 
-        # Completely freeze automated command resampling so user teleoperation maintains full control
+        # The command term runs in external-control mode (set above): it samples nothing and keeps whatever
+        # this script writes into it, so teleoperation has full control.
         cmd_term = env.command_manager.get_term("base_velocity")
         cmd_term.time_left[:] = 1e9
         cmd_term.cfg.resampling_time_range = (1e9, 1e9)
-        cmd_term.cfg.rel_forward_envs = 0.0
-        cmd_term.cfg.rel_turn_in_place_envs = 0.0
-        cmd_term.cfg.rel_heading_envs = 0.0
-        cmd_term.cfg.rel_standing_envs = 0.0
-        cmd_term.is_heading_env[:] = False
-        cmd_term.is_standing_env[:] = False
+        device = env.unwrapped.device
+        all_env_ids = torch.arange(env.num_envs, device=device)
+        robot = env.scene["robot"]
+        # Where the edge-map inputs sit inside the policy observation (only needed for --camera)
+        edge_slice = observation_term_slices(env, "policy")["camera_edges"]
+
+        # Optional hurdle bar in front of the robot (re-placed whenever an env resets)
+        hurdle_index = HURDLE_NAMES.index(f"hurdle_{args_cli.hurdle}") if args_cli.hurdle != "none" else None
+        if hurdle_index is not None:
+            cmd_term.place_hurdle_ahead(all_env_ids, index=hurdle_index, distance=0.6)
+
+        # Optional waypoint list (relative to each env's origin)
+        waypoints: list[tuple[float, float]] = []
+        if args_cli.waypoints:
+            for item in args_cli.waypoints.split(";"):
+                if item.strip():
+                    wx, wy = item.split(",")
+                    waypoints.append((float(wx), float(wy)))
+        stop_count_seen = teleop.stop_count
 
         obs = wrapped_env.get_observations()
         step = 0
@@ -406,6 +495,11 @@ def main():
 
         # Smooth rest stabilization parameter: 0.0 = nominal STAND2, 1.0 = full dynamic policy
         rest_alpha = 0.0 if (teleop.cmd_vx == 0.0 and teleop.cmd_vy == 0.0 and teleop.cmd_wz == 0.0) else 1.0
+
+        # Leg joints are the ones faded by the rest stabilizer (action order = robot joint order)
+        leg_joint_ids = [
+            i for i, name in enumerate(robot.joint_names) if any(k in name for k in ("hip", "knee", "ankle"))
+        ]
 
         # Target step duration in seconds for real-time lock
         target_step_dt = env.unwrapped.step_dt / max(args_cli.speed, 0.1)
@@ -419,56 +513,72 @@ def main():
 
                 # 1. Update velocity command from keyboard teleop
                 vx, vy, wz = teleop.update()
-                cmd_tensor = torch.tensor(
-                    [[vx, vy, wz]], device=env.unwrapped.device, dtype=torch.float32
+                cmd_tensor = torch.tensor([[vx, vy, wz]], device=device, dtype=torch.float32).repeat(env.num_envs, 1)
+
+                # 1a. Waypoint following overrides the keyboard until the list is done or a stop key is pressed
+                if waypoints and teleop.stop_count != stop_count_seen:
+                    waypoints.clear()
+                    print("\r[WAYPOINTS] Cancelled, back to keyboard control.                        ", flush=True)
+                stop_count_seen = teleop.stop_count
+                if waypoints:
+                    target = env.scene.env_origins[:, :2] + torch.tensor(waypoints[0], device=device)
+                    wp_vx, wp_wz, arrived = waypoint_velocity_controller(
+                        target - robot.data.root_link_pos_w.torch[:, :2],
+                        robot.data.heading_w.torch,
+                        max_lin_vel=cmd_term.cfg.waypoint_max_lin_vel,
+                        max_ang_vel=cmd_term.cfg.waypoint_max_ang_vel,
+                    )
+                    cmd_tensor = torch.stack([wp_vx, torch.zeros_like(wp_vx), wp_wz], dim=1)
+                    if bool(arrived.all()):
+                        print(f"\r[WAYPOINTS] Reached ({waypoints[0][0]:+.2f}, {waypoints[0][1]:+.2f}); {len(waypoints) - 1} left.   ", flush=True)
+                        waypoints.pop(0)
+                    vx, vy, wz = (float(v) for v in cmd_tensor[0])
+
+                is_at_rest = bool((cmd_tensor == 0.0).all())
+                head_tensor = torch.tensor(
+                    [[teleop.cmd_head_pitch, teleop.cmd_head_yaw]], device=device, dtype=torch.float32
                 ).repeat(env.num_envs, 1)
-
-                is_at_rest = (vx == 0.0 and vy == 0.0 and wz == 0.0)
+                # The command term is in external-control mode: it keeps these values, and the environment
+                # builds the next observation (commands, their history and the gait clock) from them.
                 cmd_term.vel_command_b[:] = cmd_tensor
-                cmd_term.is_standing_env[:] = is_at_rest
-                cmd_term.is_heading_env[:] = False
+                cmd_term.head_command[:] = head_tensor
 
-                # Feed user velocity command directly into policy observation slice (dims 48..51)
-                obs["policy"][:, 48:51] = cmd_tensor
-
-                # 1b. Update live OpenCV camera edge feed and inject into policy observation (dims 115..179)
-                edge_stat_str = ""
+                # 1b. Update live OpenCV camera edge feed and inject it into the edge-map inputs
                 if camera_feed is not None:
                     camera_feed.update_display()
                     live_edge_tensor = camera_feed.get_edge_features_tensor(device=env.unwrapped.device)
-                    obs["policy"][:, 115:179] = live_edge_tensor.repeat(env.num_envs, 1)
+                    obs["policy"][:, edge_slice] = live_edge_tensor.repeat(env.num_envs, 1)
 
-                # 2. Forward pass through trained Actor network with strict action clamping
+                # 2. Forward pass through trained Actor network, clamped exactly as in training
                 with torch.no_grad():
                     actions = policy(obs)
-                    actions = torch.clamp(actions, -1.0, 1.0)
+                    actions = torch.clamp(actions, -action_clip, action_clip)
 
-                # Active Smooth Rest Stabilizer:
-                # When at rest, smoothly transition actions to rock-solid nominal STAND2 stance (actions = 0).
-                # Exponential decay (0.88/step) eliminates chattering and prevents falling at rest.
-                if is_at_rest:
-                    rest_alpha = max(0.0, rest_alpha * 0.88)
-                    actions = actions * rest_alpha
-                else:
-                    rest_alpha = min(1.0, rest_alpha + 0.20)
-                    actions = actions * rest_alpha
+                # Smooth Rest Stabilizer (optional, --no-rest-blend disables it):
+                # When at rest, fade the leg actions to zero (nominal STAND2 stance) with an exponential
+                # decay of 0.88/step. Head joints are left to the policy so head look still works at rest.
+                if args_cli.rest_blend:
+                    if is_at_rest:
+                        rest_alpha = max(0.0, rest_alpha * 0.88)
+                    else:
+                        rest_alpha = min(1.0, rest_alpha + 0.20)
+                    actions[:, leg_joint_ids] = actions[:, leg_joint_ids] * rest_alpha
 
                 # 3. Step environment
                 obs, rewards, dones, extras = wrapped_env.step(actions)
 
-                # Keep teleop command persistent for next step
-                cmd_term.vel_command_b[:] = cmd_tensor
-                cmd_term.is_heading_env[:] = False
-                obs["policy"][:, 48:51] = cmd_tensor
+                if hurdle_index is not None and bool(dones.any()):
+                    cmd_term.place_hurdle_ahead(
+                        all_env_ids[dones.bool()], index=hurdle_index, distance=0.6
+                    )
                 if camera_feed is not None:
-                    obs["policy"][:, 115:179] = live_edge_tensor.repeat(env.num_envs, 1)
+                    obs["policy"][:, edge_slice] = live_edge_tensor.repeat(env.num_envs, 1)
 
                 # 4. Telemetry printout every 50 steps (~1.0 second)
                 if step > 0 and step % 50 == 0:
                     t_now = time.perf_counter()
                     fps = 50.0 / (t_now - t_last)
                     t_last = t_now
-                    robot = env.scene["robot"]
                     mean_z = robot.data.root_link_pos_w.torch[:, 2].mean().item()
                     mean_vx = robot.data.root_link_lin_vel_w.torch[:, 0].mean().item()
                     mean_wz = robot.data.root_link_ang_vel_w.torch[:, 2].mean().item()
@@ -477,12 +587,19 @@ def main():
                     tof_str = ""
                     if "tof_sensor" in env.scene.sensors:
                         tof = env.scene.sensors["tof_sensor"]
-                        dists = torch.nan_to_num(tof.data.ray_distances.torch, nan=2.0)
-                        min_d = dists.min().item()
-                        if min_d < 0.35:
-                            tof_str = f" | [!] ToF Obstacle: {min_d*100:4.1f} cm [JUMP!]"
+                        # Compare each row of the forward depth image with what flat ground would read at the
+                        # current sensor height; a clearly shorter reading is an obstacle
+                        dists = torch.nan_to_num(tof.data.ray_distances.torch, nan=1.0, posinf=1.0).view(-1, 8, 8)
+                        pattern = tof.cfg.pattern_cfg
+                        half_fov = math.radians(pattern.fov_deg) / 2.0
+                        elevation = torch.linspace(half_fov, -half_fov, 8, device=device) - math.radians(pattern.pitch_down_deg)
+                        sensor_height = mean_z + tof.cfg.offset.pos[2]
+                        flat = torch.where(elevation < 0.0, sensor_height / torch.sin(-elevation).clamp(min=1e-3), 1.0).clamp(max=1.0)
+                        obstacle = dists < 0.8 * flat.view(1, 8, 1)
+                        if bool(obstacle.any()):
+                            tof_str = f" | [!] ToF Obstacle: {dists[obstacle].min().item() * 100:4.1f} cm"
                         else:
-                            tof_str = f" | ToF: {min_d:4.2f}m"
+                            tof_str = " | ToF: clear"
 
                     cam_str = ""
                     if camera_feed is not None:
