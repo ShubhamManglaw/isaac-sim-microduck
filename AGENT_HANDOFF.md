@@ -208,7 +208,38 @@ Fixes E and F are fine-tuning: continue with `--resume`.
 
 ---
 
-## 7. Step 5: look at the result (playback)
+## 7. Step 5: judge the result
+
+### 7.1 Objective evaluation (do this first)
+
+```bash
+cd ~/robotics/IsaacLab
+E=~/robotics/isaac-sim-microduck/experiments/05_train_policy
+uv run python $E/evaluate_policy.py --json ~/microduck_eval.json          # newest checkpoint, ~5 minutes
+uv run python $E/record_policy.py --out ~/microduck_videos                # videos + contact sheets, no window needed
+```
+
+`evaluate_policy.py` runs 17 fixed scenarios with 64 robots each (standing, head look, walking at three
+speeds, backward, stopping from 0.5 and 0.75 m/s, turning left / right, strafing left / right, curves,
+three hurdle heights) and prints about 54 PASS / FAIL checks grouped by area: falls, rest, walk, smooth,
+head, symmetry, stop, turn, hurdle. Report the full table to the user.
+
+`record_policy.py` writes, per scenario, an `.mp4` and a `_sheet.png` (8 frames on one image). Look at the
+sheets of failing scenarios: they show *how* it fails (wobbling head, tipping forward, refusing a hurdle).
+
+What to do with failing areas (apply one, then `--resume --max_iterations 2000`, then evaluate again):
+
+| Failing area | Change in `04_rl_env/microduck_env_cfg.py` |
+|---|---|
+| `smooth` (action jitter) | `RewardsCfg.action_rate_l2` weight −0.3 → −0.5 |
+| `head` (head motion) | `RewardsCfg.head_motion` weight −0.1 → −0.2 |
+| `rest` (stepping or drifting at rest) | `RewardsCfg.stand_still_action_l2` weight −0.2 → −0.5 |
+| `stop` (slow or long stops) | `CommandsCfg` → `rel_sudden_stop_envs` 0.10 → 0.15 (take 0.05 from `rel_curve_envs`) |
+| `walk` only at 0.75 m/s | train longer; check that `Curriculum speed_scale` reached 1.00 |
+| `hurdle` | train longer first; hurdles only start at speed scale 0.90 |
+| `symmetry` | should not fail: symmetry augmentation is on. If it does, report it. |
+
+### 7.2 Interactive playback
 
 ```bash
 cd ~/robotics/IsaacLab
@@ -220,8 +251,8 @@ uv run python $P --waypoints "0.6,0;0.6,0.6;0,0"   # walks the waypoints on its 
 uv run python $P --hurdle low                      # 1.5 cm bar 0.6 m ahead (also: mid, high)
 ```
 
-Keys: `W/S` forward/back, `A/D` turn, `Q/E` strafe, `F` sprint, `Space` stop, `I/K/J/L` head,
-`C` center head. On WSL2 the 3D window needs WSLg (Windows 11); if no window opens, add
+Keys: `W/S` forward/back (sticky speed), `A/D` turn and `Q/E` strafe (in the 3D window: hold the key,
+release to stop turning), `F` sprint, `Space` stop, `I/K/J/L` head, `C` center head. On WSL2 the 3D window needs WSLg (Windows 11); if no window opens, add
 `--visualizer none --max_steps 500` to run headless and read the telemetry lines instead.
 
 Checklist to report to the user (yes / no for each):
@@ -251,7 +282,8 @@ Items 1 to 4 are the core result. Items 5 to 7 are extra tasks and may need more
 | Hurdle bars placed 0.5 mm above the floor (`HURDLE_FLOOR_GAP`) | 0.0005 | A bar that overlaps the floor stalls the contact solver. |
 | `num_steps_per_env` | 24 | See section 1. |
 | ToF sensor pattern (`TofFovPatternCfg`) | forward, 22° down | The old pattern pointed straight down and saw only the robot's own legs. |
-| Observation terms and their order | as is | Changing them invalidates every checkpoint. |
+| Observation terms and their order | as is | Changing them invalidates every checkpoint, and every term needs a left/right mirror rule (`_term_mirror_specs`); a term without one stops training at start-up. |
+| Symmetry augmentation (`symmetry_cfg` in `microduck_ppo_cfg.py`) | on | It is what makes left and right turns, strafes and steps match. The mirror rules were verified exactly in simulation. |
 
 ---
 
@@ -306,6 +338,7 @@ Known limitations:
 | Parameter | Value |
 |---|---|
 | Robots (`--preset workstation`) | 16,384 |
+| Symmetry augmentation | on (every mini-batch also trained on its mirror image; doubles the learning time) |
 | `num_steps_per_env` | 24 |
 | `num_mini_batches` (workstation) | 8 |
 | `num_learning_epochs` | 5 |
@@ -322,23 +355,24 @@ Known limitations:
 | Item | Value |
 |---|---|
 | Control rate / physics rate / episode | 50 Hz / 200 Hz / 20 s |
-| Action scale (rad per unit action) | hip yaw 0.35, hip roll 0.28, hip pitch / knee / ankle 0.40, neck 0.35, head 0.50 |
+| Action scale (rad per unit action) | hip yaw 0.35, hip roll 0.28, hip pitch / knee / ankle 0.40, neck 0.35, head 0.30 |
 | Proprioceptive history | 3 samples (60 ms) |
 | Speed curriculum | starts at 0.50; +0.05 every 20 s of sim time if tracking > 0.80 **and** more than 10 s between falls |
 | Pushes | every 2.5 to 5 s; x ±0.45 m/s, y ±0.35 m/s, yaw ±0.6 rad/s at full strength; 30% → 100% with the curriculum |
-| Smoothness penalties | 30% → 100% with the curriculum |
+| Smoothness penalties | 50% → 100% with the curriculum |
+| Command period | a new command every 2 to 5 s |
 | Hurdles | from scale 0.90 (1.5 cm bar), all bars (1.5 / 2.5 / 4 cm) at 1.00 |
 | Gait clock | cycle 0.50 s near zero speed → 0.30 s at 0.75 m/s |
-| Command mix | forward 12%, sprint 8%, turn in place 10%, backward 7%, strafe 7%, curve 14%, waypoint 10%, hurdle 8% (forward until unlocked), stand 14%, uniform random 10% |
+| Command mix | forward 10%, sprint 7%, turn in place 10%, backward 7%, strafe 7%, curve 12%, waypoint 9%, hurdle 8% (forward until unlocked), stand 12%, sudden stop 10% (run 0.40–0.75 m/s for 1–2.5 s, then stop), uniform random 8% |
 
 **Reward weights** (per second; the environment multiplies by the 0.02 s step)
 
 | Group | Terms |
 |---|---|
-| Tracking | `track_lin_vel_xy_exp` 3.0 (std 0.2 m/s), `track_ang_vel_z_exp` 2.5, `track_yaw_fine` 2.0, `directional_lin_gain` 2.0, `directional_yaw_gain` 1.0 |
+| Tracking | `track_lin_vel_xy_exp` 3.0 (std 0.2 m/s), `track_ang_vel_z_exp` 2.5 (std 0.5 rad/s), `track_yaw_fine` 2.0, `directional_lin_gain` 2.0, `directional_yaw_gain` 1.0 |
 | Standing | `stand_still_rest` 3.0, `stand_still_action_l2` −0.2, `sudden_stop_balance` 3.0 |
-| Posture | `upright` 2.0, `base_height` 1.0, `leg_posture` 1.5, `head_neck_pose` −0.1, `dof_pos_limits` −1.0 |
+| Posture | `upright` 2.0, `base_height` 1.0, `leg_posture` 1.5, `head_neck_pose` −0.3, `head_motion` −0.1 (head joint velocity), `dof_pos_limits` −1.0 |
 | Gait | `gait_contact` 1.5, `feet_air_time` 1.5, `feet_slide` −0.1, `feet_impact` −0.02 |
-| Smoothness (ramped) | `action_rate_l2` −0.02, `action_smoothness` −0.005, `joint_torques_l2` −0.03, `joint_acc_l2` −2.5e-7 |
+| Smoothness (ramped) | `action_rate_l2` −0.3, `action_smoothness` −0.05, `joint_torques_l2` −0.03, `joint_acc_l2` −2.5e-7 |
 | Other penalties | `action_l2` −0.002, `joint_vel_l2` −0.0005, `ang_vel_xy_l2` −0.05, `lin_vel_z_l2` −0.02, `fall_penalty` −100 (= −2.0 per fall) |
-| Tasks | `hurdle_clearance` 2.0, `head_look` 1.0, `getup` 4.0 (inactive while fall recovery is off) |
+| Tasks | `hurdle_clearance` 2.0, `head_look` 1.5, `getup` 4.0 (inactive while fall recovery is off) |

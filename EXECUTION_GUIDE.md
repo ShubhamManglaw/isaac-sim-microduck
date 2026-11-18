@@ -177,6 +177,14 @@ uv run python /home/shubham/robotics/isaac-sim-microduck/experiments/05_train_po
   --load_checkpoint /home/shubham/robotics/isaac-sim-microduck/experiments/05_train_policy/logs/latest/model_59900.pt
 ```
 
+### Measuring and recording a policy
+```bash
+# PASS / FAIL table over 17 scenarios (falls, rest, jitter, head, symmetry, stopping, turning, hurdles)
+uv run python /path/to/evaluate_policy.py
+# Videos and contact sheets of the same scenarios, rendered headless
+uv run python /path/to/record_policy.py --out ~/microduck_videos
+```
+
 ### Playback options:
 ```bash
 # Walk a list of waypoints (x,y in metres) on its own; [Space] cancels and returns to keyboard control
@@ -197,10 +205,10 @@ uv run python /path/to/play.py --camera
 | :--- | :--- | :--- |
 | **`[W]` / `[Up Arrow]`** | **Walk Forward** | Accelerate forward up to **$+0.75\text{ m/s}$** |
 | **`[S]` / `[Down Arrow]`**| **Walk Backward** | Step backward down to **$-0.40\text{ m/s}$** |
-| **`[A]` / `[Left Arrow]`**| **Snappy Turn Left** | Spin CCW up to **$+2.50\text{ rad/s}$** |
-| **`[D]` / `[Right Arrow]`**| **Snappy Turn Right**| Spin CW down to **$-2.50\text{ rad/s}$** |
-| **`[Q]`** | **Strafe Left** | Sidestep left up to $+0.35\text{ m/s}$ |
-| **`[E]`** | **Strafe Right** | Sidestep right down to $-0.35\text{ m/s}$ |
+| **`[A]` / `[Left Arrow]`**| **Turn Left** | 3D window: hold to turn at 1.5 rad/s, release to stop turning. Terminal: +0.35 rad/s per press |
+| **`[D]` / `[Right Arrow]`**| **Turn Right**| 3D window: hold to turn at −1.5 rad/s. Terminal: −0.35 rad/s per press |
+| **`[Q]`** | **Strafe Left** | 3D window: hold for 0.25 m/s. Terminal: +0.10 m/s per press |
+| **`[E]`** | **Strafe Right** | 3D window: hold for −0.25 m/s. Terminal: −0.10 m/s per press |
 | **`[F]`** | **Instant Sprint Boost** | Commands maximum **$+0.75\text{ m/s}$** sprint speed |
 | **`[B]` / `[Space]` / `[X]`**| **EMERGENCY HARD BRAKE** | Instantly drops command to zero; also cancels waypoint following |
 | **`[I]` / `[K]`** | **Head Look Up / Down** | Head pitch offset up to $\pm 0.35\text{ rad}$ |
@@ -316,7 +324,7 @@ uv run python train.py --num_envs 4096
 ### Q5: Bot wobbling or twitching at rest (Zero Velocity Command)
 **Resolution:**
 The system features a dual-layer rest stabilizer:
-1. **Interactive Playback (`play.py`):** Uses an exponential stance blend (`rest_alpha * 0.88` per 20ms step) that fades the leg actions toward zero, settling the robot into the nominal STAND2 stance. Disable it with `--no-rest-blend` to check the policy's own standing behavior.
+1. **Interactive Playback (`play.py`):** Uses an exponential stance blend (`rest_alpha * 0.88` per 20ms step) that fades the leg actions toward zero, settling the robot into the nominal STAND2 stance. It only engages once the robot has actually stopped (below 0.05 m/s and 0.2 rad/s), so a stop from full speed is braked by the policy itself. Disable it with `--no-rest-blend` to check the policy's own standing behavior.
 2. **RL Training (`microduck_env_cfg.py`):** 14% of commands (`rel_standing_envs=0.14`) are stand-still commands. Multi-objective rewards penalize non-zero leg actions (`stand_still_action_l2`), enforce bilateral ground contact, and lock joint positions to nominal stance.
 
 ### Q7: `ValueError: The ground slab ... is too small for N robots`

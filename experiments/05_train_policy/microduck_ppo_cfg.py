@@ -5,7 +5,10 @@ from isaaclab_rl.rsl_rl import (
     RslRlMLPModelCfg,
     RslRlOnPolicyRunnerCfg,
     RslRlPpoAlgorithmCfg,
+    RslRlSymmetryCfg,
 )
+
+from microduck_env_cfg import mirror_symmetry_augmentation
 
 
 def build_runner(wrapped_env, agent_cfg: "MicroduckPPORunnerCfg", log_dir: str | None, device: str):
@@ -74,5 +77,12 @@ class MicroduckPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         lam=0.95,
         desired_kl=0.01,
         max_grad_norm=1.0,
+        # Left/right symmetry: every mini-batch is trained on both the samples and their mirror images,
+        # so the policy behaves the same way turning or strafing left as it does right.
+        symmetry_cfg=RslRlSymmetryCfg(
+            use_data_augmentation=True,
+            use_mirror_loss=False,
+            data_augmentation_func=mirror_symmetry_augmentation,
+        ),
     )
 

@@ -80,6 +80,9 @@ class KeyboardTeleop:
 
         self.step_lin = 0.10
         self.step_ang = 0.35
+        # 3D window: turn rate / strafe speed while A/D or Q/E is held
+        self.hold_turn_rate = 1.5
+        self.hold_strafe_speed = 0.25
         self.max_lin_x_fwd = 0.75
         self.max_lin_x_bwd = -0.40
         self.max_lin_y = 0.35
@@ -209,18 +212,25 @@ class KeyboardTeleop:
                     self.cmd_vx = max(self.cmd_vx - 0.02, self.max_lin_x_bwd)
                     changed = True
 
+                # Turning and strafing are hold-to-move in the 3D window: the command jumps to the turn /
+                # strafe rate while the key is held and returns to zero when it is released. (Accumulating
+                # small increments made turns slow to start and impossible to end without counter-steering.)
+                turn_target = 0.0
                 if check_key("a") or check_key("left"):
-                    self.cmd_wz = min(self.cmd_wz + 0.05, self.max_ang_z)
-                    changed = True
+                    turn_target = self.hold_turn_rate
                 elif check_key("d") or check_key("right"):
-                    self.cmd_wz = max(self.cmd_wz - 0.05, -self.max_ang_z)
+                    turn_target = -self.hold_turn_rate
+                if turn_target != self.cmd_wz:
+                    self.cmd_wz = turn_target
                     changed = True
 
+                strafe_target = 0.0
                 if check_key("q"):
-                    self.cmd_vy = min(self.cmd_vy + 0.02, self.max_lin_y)
-                    changed = True
+                    strafe_target = self.hold_strafe_speed
                 elif check_key("e"):
-                    self.cmd_vy = max(self.cmd_vy - 0.02, -self.max_lin_y)
+                    strafe_target = -self.hold_strafe_speed
+                if strafe_target != self.cmd_vy:
+                    self.cmd_vy = strafe_target
                     changed = True
 
                 if check_key("f"):
@@ -445,10 +455,10 @@ def main():
         print(" Controls (usable in BOTH Terminal and 3D Window):")
         print("   [W] / [Up Arrow]    : Walk Forward       (+Vx up to +0.75 m/s)")
         print("   [S] / [Down Arrow]  : Walk Backward      (-Vx down to -0.40 m/s)")
-        print("   [A] / [Left Arrow]  : Turn Left (CCW)    (+Wz up to +2.50 rad/s)")
-        print("   [D] / [Right Arrow] : Turn Right (CW)    (-Wz down to -2.50 rad/s)")
-        print("   [Q]                 : Strafe Left        (+Vy up to +0.35 m/s)")
-        print("   [E]                 : Strafe Right       (-Vy down to -0.35 m/s)")
+        print("   [A] / [Left Arrow]  : Turn Left (CCW)    (3D window: hold, 1.5 rad/s | terminal: +0.35 per press)")
+        print("   [D] / [Right Arrow] : Turn Right (CW)    (3D window: hold, 1.5 rad/s | terminal: -0.35 per press)")
+        print("   [Q]                 : Strafe Left        (3D window: hold, 0.25 m/s | terminal: +0.10 per press)")
+        print("   [E]                 : Strafe Right       (3D window: hold, 0.25 m/s | terminal: -0.10 per press)")
         print("   [F]                 : Instant Sprint     (Sprint to +0.75 m/s maximum speed)")
         print("   [B] / [Space] / [X] : EMERGENCY BRAKE    (Sudden stop; also cancels waypoint following)")
         print("   [I] / [K]           : Head Look Up / Down (pitch offset up to +/-0.35 rad)")
@@ -494,7 +504,7 @@ def main():
         t_last = time.perf_counter()
 
         # Smooth rest stabilization parameter: 0.0 = nominal STAND2, 1.0 = full dynamic policy
-        rest_alpha = 0.0 if (teleop.cmd_vx == 0.0 and teleop.cmd_vy == 0.0 and teleop.cmd_wz == 0.0) else 1.0
+        rest_alpha = 1.0
 
         # Leg joints are the ones faded by the rest stabilizer (action order = robot joint order)
         leg_joint_ids = [
@@ -555,12 +565,17 @@ def main():
                     actions = torch.clamp(actions, -action_clip, action_clip)
 
                 # Smooth Rest Stabilizer (optional, --no-rest-blend disables it):
-                # When at rest, fade the leg actions to zero (nominal STAND2 stance) with an exponential
-                # decay of 0.88/step. Head joints are left to the policy so head look still works at rest.
+                # Once the robot has actually come to a stop, fade the leg actions to zero (nominal STAND2
+                # stance) with an exponential decay of 0.88/step. It must not engage while the robot is still
+                # moving: freezing the legs at speed (e.g. [Space] at a sprint) makes the robot tip over, so
+                # until then the policy brakes on its own. Head joints are left to the policy.
                 if args_cli.rest_blend:
-                    if is_at_rest:
+                    lin_speed = float(torch.norm(robot.data.root_lin_vel_b.torch[:, :2], dim=1).max())
+                    yaw_rate = float(robot.data.root_ang_vel_b.torch[:, 2].abs().max())
+                    settled = lin_speed < 0.05 and yaw_rate < 0.2
+                    if is_at_rest and (settled or rest_alpha < 1.0):
                         rest_alpha = max(0.0, rest_alpha * 0.88)
-                    else:
+                    elif not is_at_rest:
                         rest_alpha = min(1.0, rest_alpha + 0.20)
                     actions[:, leg_joint_ids] = actions[:, leg_joint_ids] * rest_alpha
 

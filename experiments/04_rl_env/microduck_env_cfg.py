@@ -33,6 +33,7 @@ from isaaclab.sensors.ray_caster.patterns.patterns_cfg import PatternBaseCfg
 from isaaclab.utils import configclass
 from isaaclab.utils import math as math_utils
 from isaaclab.utils.noise import UniformNoiseCfg
+from tensordict import TensorDict
 
 from microduck_cfg import MicroduckArticulationCfg
 
@@ -224,6 +225,10 @@ class MicroduckVelocityCommand(UniformVelocityCommand):
         self.getup_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.gait_phase = torch.rand(self.num_envs, device=self.device)
 
+        # Sudden-stop envs run at speed until stop_timer [s] reaches zero, then are commanded to stand
+        self.is_stop_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.stop_timer = torch.zeros(self.num_envs, device=self.device)
+
         self._hurdles: list[RigidObject] = []
         self._hurdle_heights: list[float] = []
         for name, height in zip(cfg.hurdle_asset_names, cfg.hurdle_heights):
@@ -293,7 +298,10 @@ class MicroduckVelocityCommand(UniformVelocityCommand):
     # Command sampling
     # --------------------------------------------------------------------------
     def _resample_command(self, env_ids: Sequence[int]):
-        super()._resample_command(env_ids)
+        # Teleoperation / playback write the commands themselves; sampling random ones here would feed the
+        # policy a random command (and command history) for a step after every reset.
+        if not self.cfg.external_control:
+            super()._resample_command(env_ids)
 
         if isinstance(env_ids, slice):
             all_env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)[env_ids]
@@ -307,6 +315,7 @@ class MicroduckVelocityCommand(UniformVelocityCommand):
             return
 
         self.is_waypoint_env[all_env_ids] = False
+        self.is_stop_env[all_env_ids] = False
 
         # Teleoperation / playback: commands are written from outside, nothing to sample
         if self.cfg.external_control:
@@ -346,12 +355,13 @@ class MicroduckVelocityCommand(UniformVelocityCommand):
                     cfg.rel_waypoint_envs,
                     rel_hurdle,
                     cfg.rel_standing_envs,
+                    cfg.rel_sudden_stop_envs,
                 ],
                 device=dev,
             ),
             dim=0,
         )
-        category = torch.bucketize(r, edges, right=True)  # 0..8 = forced categories, 9 = uniform remainder
+        category = torch.bucketize(r, edges, right=True)  # 0..9 = forced categories, 10 = uniform remainder
         max_ang = max(abs(cfg.ranges.ang_vel_z[0]), abs(cfg.ranges.ang_vel_z[1]))
 
         def select(index: int) -> torch.Tensor:
@@ -429,6 +439,22 @@ class MicroduckVelocityCommand(UniformVelocityCommand):
             if cfg.heading_command:
                 self.is_heading_env[ids] = False
 
+        # 9. Sudden stop: run (mostly straight, sometimes curving) and then get an abrupt stop command.
+        # The command period is extended so the stop always happens and is followed by a few seconds of standing.
+        ids = select(9)
+        if len(ids) > 0:
+            n = len(ids)
+            curving = torch.rand(n, device=dev) < 0.3
+            set_cmd(
+                ids,
+                uniform(n, *cfg.sudden_stop_speed_range) * s,
+                0.0,
+                random_sign(n) * uniform(n, 0.3, 1.0) * s * curving,
+            )
+            self.stop_timer[ids] = uniform(n, *cfg.sudden_stop_run_time_range)
+            self.time_left[ids] = self.stop_timer[ids] + uniform(n, 2.0, 3.0)
+            self.is_stop_env[ids] = True
+
         # Head look target: straight ahead for a share of envs, otherwise a random pitch / yaw offset
         look = torch.rand(num, device=dev) >= cfg.rel_head_centered_envs
         self.head_command[all_env_ids, 0] = uniform(num, *cfg.head_pitch_range) * look
@@ -455,6 +481,13 @@ class MicroduckVelocityCommand(UniformVelocityCommand):
 
     def _update_sampled_command(self):
         super()._update_command()
+
+        # Sudden-stop envs: switch to a stand command when the run time is over
+        if self.is_stop_env.any():
+            self.stop_timer -= self._env.step_dt
+            stopped = self.is_stop_env & (self.stop_timer <= 0.0)
+            self.vel_command_b[stopped] = 0.0
+            self.is_standing_env |= stopped
 
         # Waypoint envs: steer toward the target
         if self.is_waypoint_env.any():
@@ -508,10 +541,10 @@ class MicroduckVelocityCommandCfg(UniformVelocityCommandCfg):
     gait_speed_ref: float = 0.75
     """Commanded speed [m/s] at which the gait cycle reaches ``gait_period_fast``."""
 
-    rel_forward_envs: float = 0.12
+    rel_forward_envs: float = 0.10
     """Fraction of envs walking straight forward at [forward_min_vel, 0.55] m/s."""
 
-    rel_sprint_envs: float = 0.08
+    rel_sprint_envs: float = 0.07
     """Fraction of envs sprinting forward at [0.55, 0.75] m/s."""
 
     forward_min_vel: float = 0.35
@@ -529,10 +562,10 @@ class MicroduckVelocityCommandCfg(UniformVelocityCommandCfg):
     rel_strafe_envs: float = 0.07
     """Fraction of envs strafing sideways at |vy| in [0.20, 0.35] m/s."""
 
-    rel_curve_envs: float = 0.14
+    rel_curve_envs: float = 0.12
     """Fraction of envs walking forward while turning (combined vx + wz)."""
 
-    rel_waypoint_envs: float = 0.10
+    rel_waypoint_envs: float = 0.09
     """Fraction of envs walking to a waypoint."""
 
     waypoint_distance_range: tuple[float, float] = (0.4, 1.5)
@@ -562,8 +595,17 @@ class MicroduckVelocityCommandCfg(UniformVelocityCommandCfg):
     hurdle_speed_range: tuple[float, float] = (0.25, 0.45)
     """Forward speed [m/s] commanded in hurdle envs (not scaled; hurdles unlock late)."""
 
-    rel_standing_envs: float = 0.14
+    rel_standing_envs: float = 0.12
     """Fraction of envs commanded to stand still."""
+
+    rel_sudden_stop_envs: float = 0.10
+    """Fraction of envs that run and then get an abrupt stop command (the [Space] key in play.py)."""
+
+    sudden_stop_speed_range: tuple[float, float] = (0.40, 0.75)
+    """Forward speed [m/s] before the stop (scaled by the speed curriculum)."""
+
+    sudden_stop_run_time_range: tuple[float, float] = (1.0, 2.5)
+    """How long [s] the robot runs before the stop command."""
 
     rel_head_centered_envs: float = 0.5
     """Fraction of envs whose head look command is straight ahead."""
@@ -1308,6 +1350,126 @@ def smoothness_penalty_ramp(
 
 
 # ==============================================================================
+# LEFT / RIGHT SYMMETRY (data augmentation for PPO)
+# ==============================================================================
+# Mirroring the robot across its sagittal (x-z) plane. Verified in simulation: a joint configuration and
+# its mirror image produce body positions that are mirror images of each other (legs within 4 mm).
+#   legs:  left <-> right, and every leg joint changes sign (the left and right joint axes are mirrored)
+#   head:  neck_pitch and head_pitch keep their sign, head_yaw and head_roll change sign
+#   vectors in the base frame: y components flip for linear quantities (velocity, gravity),
+#   x and z components flip for angular velocity
+#   ToF image: columns are reversed; gait clock: shifted by half a cycle (the other foot leads)
+
+
+def _joint_mirror(joint_names: list[str]) -> tuple[list[int], list[float]]:
+    """Index permutation and sign flips that mirror a vector ordered like ``joint_names``."""
+    perm, sign = [], []
+    for name in joint_names:
+        if name.startswith("left_"):
+            perm.append(joint_names.index("right_" + name[len("left_"):]))
+            sign.append(-1.0)
+        elif name.startswith("right_"):
+            perm.append(joint_names.index("left_" + name[len("right_"):]))
+            sign.append(-1.0)
+        else:
+            perm.append(joint_names.index(name))
+            sign.append(-1.0 if ("yaw" in name or "roll" in name) else 1.0)
+    return perm, sign
+
+
+def _image_mirror(rows: int = 8, cols: int = 8) -> tuple[list[int], list[float]]:
+    """Reverse the columns of a row-major image."""
+    perm = [r * cols + (cols - 1 - c) for r in range(rows) for c in range(cols)]
+    return perm, [1.0] * (rows * cols)
+
+
+def _term_mirror_specs(joint_names: list[str]) -> dict[str, tuple[list[int], list[float]]]:
+    """Mirror spec (permutation, signs) of one sample of every observation term, by term name."""
+    joints = _joint_mirror(joint_names)
+    image = _image_mirror()
+    return {
+        # policy group
+        "projected_gravity": ([0, 1, 2], [1.0, -1.0, 1.0]),
+        "base_ang_vel": ([0, 1, 2], [-1.0, 1.0, -1.0]),
+        "joint_pos": joints,
+        "joint_vel": joints,
+        "actions": joints,
+        "velocity_commands": ([0, 1, 2], [1.0, -1.0, -1.0]),
+        "tof_depth": image,
+        "camera_edges": image,
+        "head_look": ([0, 1], [1.0, -1.0]),
+        "gait_clock": ([0, 1], [-1.0, -1.0]),
+        # critic group
+        "base_lin_vel": ([0, 1, 2], [1.0, -1.0, 1.0]),
+        "base_pos_z": ([0], [1.0]),
+        "joint_effort": joints,
+        "hurdle_state": ([0, 1, 2, 3], [1.0, -1.0, 1.0, 1.0]),
+        "foot_forces": ([1, 0], [1.0, 1.0]),
+        "task_flags": ([0, 1], [1.0, 1.0]),
+    }
+
+
+def build_group_mirror(env: ManagerBasedRLEnv, group: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """Permutation and sign vectors that mirror a whole concatenated observation group.
+
+    Terms with history are handled per stored sample. Raises if a term has no mirror spec, so adding an
+    observation term without defining its mirror image fails loudly instead of silently corrupting training.
+    """
+    specs = _term_mirror_specs(env.scene["robot"].joint_names)
+    perm: list[int] = []
+    sign: list[float] = []
+    offset = 0
+    for name, dim in zip(env.observation_manager.active_terms[group], env.observation_manager.group_obs_term_dim[group]):
+        size = int(math.prod(dim))
+        if name not in specs:
+            raise KeyError(f"No left/right mirror defined for observation term '{name}' (group '{group}').")
+        local_perm, local_sign = specs[name]
+        base = len(local_perm)
+        if size % base != 0:
+            raise ValueError(f"Observation term '{name}' has {size} values, not a multiple of its mirror size {base}.")
+        for block in range(size // base):
+            perm.extend(offset + block * base + i for i in local_perm)
+            sign.extend(local_sign)
+        offset += size
+    device = env.device
+    return torch.tensor(perm, dtype=torch.long, device=device), torch.tensor(sign, device=device)
+
+
+def build_action_mirror(env: ManagerBasedRLEnv) -> tuple[torch.Tensor, torch.Tensor]:
+    """Permutation and sign vectors that mirror an action vector (actions are ordered like the robot joints)."""
+    joint_names = env.action_manager.get_term("joint_pos")._joint_names
+    perm, sign = _joint_mirror(joint_names)
+    return torch.tensor(perm, dtype=torch.long, device=env.device), torch.tensor(sign, device=env.device)
+
+
+@torch.no_grad()
+def mirror_symmetry_augmentation(env, obs: TensorDict | None = None, actions: torch.Tensor | None = None):
+    """rsl_rl symmetry hook: return the batch followed by its left/right mirror image (batch size x2)."""
+    base_env = env.unwrapped if hasattr(env, "unwrapped") else env
+    cache = base_env.__dict__.get("_mirror_cache")
+    if cache is None:
+        cache = {"action": build_action_mirror(base_env)}
+        for group in base_env.observation_manager.active_terms:
+            cache[group] = build_group_mirror(base_env, group)
+        base_env._mirror_cache = cache
+
+    obs_aug = None
+    if obs is not None:
+        batch_size = obs.batch_size[0]
+        obs_aug = obs.repeat(2)
+        for key in obs.keys():
+            perm, sign = cache[key]
+            obs_aug[key][batch_size:] = obs[key][:, perm] * sign
+
+    actions_aug = None
+    if actions is not None:
+        perm, sign = cache["action"]
+        actions_aug = torch.cat([actions, actions[:, perm] * sign], dim=0)
+
+    return obs_aug, actions_aug
+
+
+# ==============================================================================
 # 1. SCENE CONFIGURATION
 # ==============================================================================
 def _hurdle_cfg(name: str, height: float) -> RigidObjectCfg:
@@ -1390,7 +1552,7 @@ class ActionsCfg:
             ".*knee.*": 0.40,
             ".*ankle.*": 0.40,
             ".*neck.*": 0.35,
-            ".*head.*": 0.50,
+            ".*head.*": 0.30,
         },
         use_default_offset=True,
         # Joint targets are clamped just inside the joint limits. The policy output itself is only loosely
@@ -1419,7 +1581,8 @@ class CommandsCfg:
 
     base_velocity: MicroduckVelocityCommandCfg = MicroduckVelocityCommandCfg(
         asset_name="robot",
-        resampling_time_range=(2.5, 6.0),
+        # Short command periods: the policy has to react to new commands often (turning response, stops)
+        resampling_time_range=(2.0, 5.0),
         rel_heading_envs=0.20,
         heading_command=True,
         heading_control_stiffness=0.60,
@@ -1692,6 +1855,7 @@ class EventCfg:
 LEG_JOINTS = [".*hip.*", ".*knee.*", ".*ankle.*"]
 FOOT_BODIES = [".*ankle.*"]
 SMOOTHNESS_TERMS = ["action_rate_l2", "action_smoothness", "joint_acc_l2", "joint_torques_l2"]
+HEAD_JOINTS = ["neck_pitch", "head_pitch", "head_yaw", "head_roll"]
 
 
 @configclass
@@ -1708,7 +1872,7 @@ class RewardsCfg:
     track_ang_vel_z_exp = RewardTermCfg(
         func=track_ang_vel_z,
         weight=2.5,
-        params={"command_name": "base_velocity", "std": math.sqrt(0.5), "asset_cfg": SceneEntityCfg("robot")},
+        params={"command_name": "base_velocity", "std": 0.5, "asset_cfg": SceneEntityCfg("robot")},
     )
     track_yaw_fine = RewardTermCfg(
         func=track_yaw_fine,
@@ -1776,7 +1940,7 @@ class RewardsCfg:
     # Head look command tracking
     head_look = RewardTermCfg(
         func=head_look_tracking,
-        weight=1.0,
+        weight=1.5,
         params={
             "command_name": "base_velocity",
             "asset_cfg": SceneEntityCfg("robot", joint_names=["head_pitch", "head_yaw"], preserve_order=True),
@@ -1826,10 +1990,13 @@ class RewardsCfg:
         params={"asset_cfg": SceneEntityCfg("robot")},
     )
 
-    # 6. Smoothness & Energy. The four terms listed in SMOOTHNESS_TERMS start at 30% of the weights given
+    # 6. Smoothness & Energy. The four terms listed in SMOOTHNESS_TERMS start at 50% of the weights given
     # here and ramp to 100% with the speed curriculum (see CurriculumCfg.smoothness_ramp).
-    action_rate_l2 = RewardTermCfg(func=mdp.action_rate_l2, weight=-0.02)
-    action_smoothness = RewardTermCfg(func=action_smoothness_l2, weight=-0.005)
+    # Sized so jitter costs something: at an action-change RMS of 0.3 per step (what a 450-iteration test
+    # policy showed) action_rate costs ~0.4/s at full weight, versus 3.0/s for velocity tracking; at a smooth
+    # 0.1 per step it costs ~0.04/s. The previous -0.02 cost only ~0.03/s for the jittery gait.
+    action_rate_l2 = RewardTermCfg(func=mdp.action_rate_l2, weight=-0.3)
+    action_smoothness = RewardTermCfg(func=action_smoothness_l2, weight=-0.05)
     joint_vel_l2 = RewardTermCfg(
         func=mdp.joint_vel_l2,
         weight=-0.0005,
@@ -1886,11 +2053,17 @@ class RewardsCfg:
         },
     )
 
-    # 9. Neck / head-roll regularization (head pitch and yaw are driven by the look command instead)
+    # 9. Head stability. The head is light but sits high, so the policy can swing it as a counterweight
+    # to balance; these terms make it hold the neck still and move the head only to follow look commands.
     head_neck_pose = RewardTermCfg(
         func=mdp.joint_deviation_l1,
-        weight=-0.1,
+        weight=-0.3,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=["neck_pitch", "head_roll"])},
+    )
+    head_motion = RewardTermCfg(
+        func=mdp.joint_vel_l2,
+        weight=-0.1,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=HEAD_JOINTS)},
     )
 
 
@@ -1932,7 +2105,7 @@ class CurriculumCfg:
     """Curriculum terms."""
 
     # Commanded speeds start at 50% and grow to 100% once the robot tracks well AND stays on its feet.
-    # Along the way: pushes and smoothness penalties ramp from 30% to 100%, hurdles unlock at 0.90
+    # Along the way: pushes and smoothness penalties ramp from 50% to 100%, hurdles unlock at 0.90
     # (lowest bar only until 1.0), and fall recovery (if enabled) unlocks at 0.70.
     command_speed = CurriculumTermCfg(
         func=command_speed_curriculum,
@@ -1947,7 +2120,7 @@ class CurriculumCfg:
 
     smoothness_ramp = CurriculumTermCfg(
         func=smoothness_penalty_ramp,
-        params={"command_name": "base_velocity", "term_names": SMOOTHNESS_TERMS, "start_fraction": 0.3},
+        params={"command_name": "base_velocity", "term_names": SMOOTHNESS_TERMS, "start_fraction": 0.5},
     )
 
 
