@@ -208,24 +208,31 @@ class KeyboardTeleop:
 
 
 def find_latest_checkpoint(root_log_dir: Path) -> Path | None:
-    """Finds the most recent checkpoint file from training logs."""
+    """Finds the most recent checkpoint file from training logs by directory timestamp."""
     latest_symlink = root_log_dir / "latest"
-    target_dir = latest_symlink.resolve() if latest_symlink.exists() else root_log_dir
+    if latest_symlink.is_symlink() or latest_symlink.exists():
+        try:
+            target_dir = latest_symlink.resolve()
+            if target_dir.is_dir():
+                pts = sorted(
+                    target_dir.glob("model_*.pt"),
+                    key=lambda f: int(f.stem.split("_")[-1]) if f.stem.split("_")[-1].isdigit() else -1,
+                )
+                if pts:
+                    return pts[-1]
+        except Exception:
+            pass
 
-    if target_dir.is_dir():
+    # Find the most recently modified run directory in root_log_dir
+    run_dirs = [d for d in root_log_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+    run_dirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+    for rd in run_dirs:
         pts = sorted(
-            target_dir.glob("model_*.pt"),
+            rd.glob("model_*.pt"),
             key=lambda f: int(f.stem.split("_")[-1]) if f.stem.split("_")[-1].isdigit() else -1,
         )
         if pts:
             return pts[-1]
-
-    all_pts = sorted(
-        root_log_dir.glob("**/model_*.pt"),
-        key=lambda f: int(f.stem.split("_")[-1]) if f.stem.split("_")[-1].isdigit() else -1,
-    )
-    if all_pts:
-        return all_pts[-1]
     return None
 
 
@@ -346,6 +353,9 @@ def main():
         step = 0
         t_last = time.perf_counter()
 
+        # Smooth rest stabilization parameter: 0.0 = nominal STAND2, 1.0 = full dynamic policy
+        rest_alpha = 0.0 if (teleop.cmd_vx == 0.0 and teleop.cmd_vy == 0.0 and teleop.cmd_wz == 0.0) else 1.0
+
         # Target step duration in seconds for real-time lock
         target_step_dt = env.unwrapped.step_dt / max(args_cli.speed, 0.1)
 
@@ -375,10 +385,15 @@ def main():
                     actions = policy(obs)
                     actions = torch.clamp(actions, -1.0, 1.0)
 
-                # Let trained policy actively brake and stabilize until robot comes to a complete stop
-                actual_speed = torch.norm(env.scene["robot"].data.root_link_lin_vel_w.torch[:, :2], dim=1).max().item()
-                if is_at_rest and actual_speed < 0.03:
-                    actions = torch.zeros_like(actions)
+                # Active Smooth Rest Stabilizer:
+                # When at rest, smoothly transition actions to rock-solid nominal STAND2 stance (actions = 0).
+                # Exponential decay (0.88/step) eliminates chattering and prevents falling at rest.
+                if is_at_rest:
+                    rest_alpha = max(0.0, rest_alpha * 0.88)
+                    actions = actions * rest_alpha
+                else:
+                    rest_alpha = min(1.0, rest_alpha + 0.20)
+                    actions = actions * rest_alpha
 
                 # 3. Step environment
                 obs, rewards, dones, extras = wrapped_env.step(actions)
